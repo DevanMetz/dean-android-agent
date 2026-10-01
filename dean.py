@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import wave
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -191,6 +192,15 @@ class Utterance:
     def __init__(self, voice):
         self.voice, self.buf, self.proc, self.spoken = voice, "", None, False
         self.first_audio = None  # time.time() when the first sound was queued
+        self.cancelled = False
+        self.recent = deque(maxlen=3)  # last sentences spoken, to ignore our own echo
+
+    def cancel(self):
+        """Stop talking right now (called from the interrupt listener)."""
+        self.cancelled = True
+        proc = self.proc
+        if proc:
+            proc.kill()
 
     def feed(self, text):
         self.buf += text
@@ -204,16 +214,20 @@ class Utterance:
         self._say(self.buf)
         self.buf = ""
         if self.proc:
-            self.proc.stdin.close()
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass  # killed by cancel()
             self.proc.wait()
             self.proc = None
             self.voice.lock.release()
 
     def _say(self, sentence):
         sentence = sentence.strip()
-        if not sentence:
+        if not sentence or self.cancelled:
             return
         self.spoken = True
+        self.recent.append(sentence.lower())
         v = self.voice
         if v.piper is None:  # fallback: Android's engine (slow to start, ~3.5 s)
             with v.lock:
@@ -225,22 +239,38 @@ class Utterance:
             self.proc = subprocess.Popen(
                 ["pacat", "--playback", "--format=s16le", f"--rate={v.rate}", "--channels=1"],
                 stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        for chunk in v.piper.synthesize(sentence):
-            self.first_audio = self.first_audio or time.time()
-            self.proc.stdin.write(chunk.audio_int16_bytes)
-        self.proc.stdin.flush()
+        try:
+            for chunk in v.piper.synthesize(sentence):
+                if self.cancelled:
+                    return
+                self.first_audio = self.first_audio or time.time()
+                self.proc.stdin.write(chunk.audio_int16_bytes)
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass  # playback was killed by cancel()
 
 
 # ---------- listening ----------
 
+# what Moonshine writes when someone really says "hey Dean" / "stop"
+SAID_DEAN = re.compile(r"\b(dean|deen|deane|dene|hayden|haydn)\b")
+SAID_STOP = re.compile(r"\b(stop|quiet|shut up|enough|cancel|never ?mind|be quiet)\b")
+
+
+def recent_audio(ring):
+    return np.frombuffer(b"".join(ring), dtype=np.int16).astype(np.float32) / 32768.0
+
+
 class Listener:
-    def __init__(self, mic):
+    def __init__(self, mic, transcribe):
         self.mic = mic
+        self.transcribe = transcribe
         self.noise = 200.0  # running estimate of background loudness
         self.silent_since = None
-        vosk = Model(str(Path(os.environ.get("DEAN_VOSK", "/opt/models/vosk-model-small-en-us-0.15"))))
+        self.vosk = Model(str(Path(os.environ.get("DEAN_VOSK", "/opt/models/vosk-model-small-en-us-0.15"))))
         grammar = json.dumps(["hey dean", "dean", "hey", "[unk]"])
-        self.wake = KaldiRecognizer(vosk, RATE, grammar)
+        self.wake = KaldiRecognizer(self.vosk, RATE, grammar)
+        self.ring = deque(maxlen=25)  # last 2.5 s of audio
 
     def _track(self, data):
         level = rms(data)
@@ -254,9 +284,14 @@ class Listener:
         return level
 
     def wait_for_wake(self):
+        """Vosk spots a possible "hey dean" cheaply; Moonshine then re-reads the last
+        2.5 s and must hear "Dean" too. Vosk alone forces any speech into its tiny
+        grammar, which caused false wake-ups."""
         self.wake.Reset()
+        self.ring.clear()
         while True:
             data = self.mic.read()
+            self.ring.append(data)
             level = self._track(data)
             self.noise = 0.97 * self.noise + 0.03 * min(level, self.noise * 2 + 50)
             if self.wake.AcceptWaveform(data):
@@ -265,7 +300,11 @@ class Listener:
                 heard = json.loads(self.wake.PartialResult()).get("partial", "")
             if any(p in heard for p in WAKE_PHRASES):
                 self.wake.Reset()
-                return
+                text = self.transcribe(recent_audio(self.ring), save=False)
+                if SAID_DEAN.search(text.lower()):
+                    return
+                show("status", f"ignored a false wake-up (heard \"{text}\")")
+                self.ring.clear()
 
     def record_command(self, max_wait=6.0, max_len=15.0, end_silence=None):
         """Record until the speaker pauses. Returns float32 audio or None."""
@@ -292,6 +331,50 @@ class Listener:
 
 class MicMuted(Exception):
     pass
+
+
+class Interrupter(threading.Thread):
+    """While Dean is thinking or talking, listen for "stop" or "hey dean" and cut
+    it off. The mic also hears Dean's own voice, so a word only counts if
+    Moonshine confirms it and Dean isn't saying that word right now."""
+
+    def __init__(self, listener, utterance):
+        super().__init__(daemon=True)
+        self.ear, self.utt = listener, utterance
+        self.done = threading.Event()  # set by the main loop when the reply is over
+        self.fired = threading.Event()  # set here when interrupted
+        self.kind = None  # "stop" or "wake"
+
+    def run(self):
+        rec = KaldiRecognizer(self.ear.vosk, RATE, json.dumps(["hey dean", "dean", "stop", "[unk]"]))
+        ring = deque(maxlen=20)  # 2 s
+        last_check = 0.0
+        while not self.done.is_set():
+            data = self.ear.mic.read()
+            ring.append(data)
+            if rec.AcceptWaveform(data):
+                heard = json.loads(rec.Result()).get("text", "")
+            else:
+                heard = json.loads(rec.PartialResult()).get("partial", "")
+            if not ("dean" in heard or "stop" in heard) or time.time() - last_check < 0.5:
+                continue
+            last_check = time.time()
+            rec.Reset()
+            text = self.ear.transcribe(recent_audio(ring), save=False).lower()
+            echo = " ".join(self.utt.recent)
+            if SAID_STOP.search(text) and not SAID_STOP.search(echo):
+                self.kind = "stop"
+            elif SAID_DEAN.search(text) and not SAID_DEAN.search(echo):
+                self.kind = "wake"
+            else:
+                continue
+            self.utt.cancel()
+            self.fired.set()
+            return
+
+    def finish(self):
+        self.done.set()
+        self.join()
 
 
 # ---------- speech-to-text ----------
@@ -323,12 +406,13 @@ class Transcriber:
             tokens=f"{d}/tokens.txt", num_threads=2)
         self(np.zeros(RATE, dtype=np.float32))  # warm-up so the first command isn't slow
 
-    def __call__(self, audio):
+    def __call__(self, audio, save=True):
         # this tablet's mic records quietly; bring speech up to a consistent level
         peak = float(np.abs(audio).max()) if audio.size else 0.0
         if 0 < peak < 0.5:
             audio = audio * min(0.5 / peak, 20.0)
-        save_last_command(audio)
+        if save:
+            save_last_command(audio)
         s = self.rec.create_stream()
         s.accept_waveform(RATE, audio)
         self.rec.decode_stream(s)
@@ -340,6 +424,10 @@ class Transcriber:
 TOOL_STATUS = {"web_search": "searching the web…", "look": "taking a photo…",
                "get_weather": "checking the weather…", "lights": "lights…",
                "get_location": "checking location…", "read_sensors": "reading sensors…"}
+
+
+class Interrupted(Exception):
+    pass
 
 
 class APIError(Exception):
@@ -373,7 +461,7 @@ class Brain:
             parts.append("Things you've been asked to remember: " + " | ".join(mem))
         return " ".join(p for p in parts if p)
 
-    def stream_round(self, body, on_text):
+    def stream_round(self, body, on_text, should_stop=lambda: False):
         """One streamed request. Returns the assembled assistant message."""
         for attempt in range(3):
             with self.http.stream("POST", self.URL, json=body) as r:
@@ -392,6 +480,8 @@ class Brain:
                     raise APIError(r.status_code, detail[:200])
                 content, calls, reasoning = "", {}, {}
                 for line in r.iter_lines():
+                    if should_stop():
+                        raise Interrupted()
                     if not line.startswith("data: "):
                         continue  # keep-alive comments
                     payload = line[6:]
@@ -437,7 +527,7 @@ class Brain:
         show("status", TOOL_STATUS.get(name, f"{name.replace('_', ' ')}…"))
         return self.tools.call(name, args)
 
-    def ask(self, text, on_text=lambda t: None):
+    def ask(self, text, on_text=lambda t: None, should_stop=lambda: False):
         """Answer `text`, streaming spoken text to on_text as it arrives."""
         if time.time() - self.last > CONVO_IDLE_RESET or len(self.messages) >= MAX_TURNS * 6:
             self.messages = []
@@ -464,7 +554,7 @@ class Brain:
                     "max_tokens": 4000,
                     "reasoning": {"effort": EFFORT},
                     "stream": True,
-                }, emit)
+                }, emit, should_stop)
                 new_round[0] = True
                 self.messages.append(msg)
                 calls = msg.get("tool_calls") or []
@@ -477,8 +567,18 @@ class Brain:
                 for call, result in zip(calls, results):
                     self.messages.append({"role": "tool", "tool_call_id": call["id"],
                                           "content": json.dumps(result)[:8000]})
+                if should_stop():
+                    raise Interrupted()
             del self.messages[start:]
             return self._fail(emit, spoken, "Sorry, that took too many steps. Try asking a simpler way.")
+        except Interrupted:
+            # keep the exchange as plain text so follow-ups still have context
+            del self.messages[start + 1:]
+            said = "".join(spoken).strip()
+            self.messages.append({"role": "assistant",
+                                  "content": (said + " " if said else "") + "[cut off by the user]"})
+            self.last = time.time()
+            return said
         except APIError as e:
             del self.messages[start:]
             show("err", f"OpenRouter {e.status}: {e}")
@@ -535,7 +635,7 @@ def main():
     voice = Voice()
     mic = Mic()
     mic.start()
-    ear = Listener(mic)
+    ear = Listener(mic, transcribe)
     brain = Brain(say=voice.speak)
     show("status", f"ready  ({MODEL}, effort {EFFORT})")
     where = brain.tools.place_line()
@@ -570,17 +670,27 @@ def main():
             continue
         stt = time.time() - heard
         show("you", text)
-        mic.stop()  # don't listen to ourselves while thinking/speaking
         utt = voice.utterance()
-        reply = brain.ask(text, on_text=utt.feed)
-        show("dean", reply)
-        if not utt.spoken and not utt.buf.strip():
-            utt.feed(reply)
+        barge = Interrupter(ear, utt)  # "stop" / "hey dean" cut Dean off
+        barge.start()
+        reply = brain.ask(text, on_text=utt.feed, should_stop=barge.fired.is_set)
+        if not barge.fired.is_set():
+            show("dean", reply)
+            if not utt.spoken and not utt.buf.strip():
+                utt.feed(reply)
         utt.finish()
+        barge.finish()
+        if barge.kind == "stop":
+            show("status", "stopped")
+            play(CHIME_DONE)
+            continue
+        if barge.kind == "wake":
+            show("status", "interrupted")
+            follow_up = True  # go straight to listening for the new request
+            continue
         if utt.first_audio:
             show("status", f"speech-to-text {stt:.1f}s · first word {utt.first_audio - heard:.1f}s "
                            "after you stopped talking")
-        mic.start()
         # if Dean asked something, listen for the answer without needing "hey dean"
         follow_up = reply.rstrip().endswith("?")
 
