@@ -10,6 +10,7 @@ Runs inside the Debian proot on the tablet; launched by run.sh.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -18,7 +19,10 @@ from pathlib import Path
 
 import httpx
 import numpy as np
+import onnxruntime
 from faster_whisper import WhisperModel
+
+onnxruntime.set_default_logger_severity(3)  # hide harmless GPU-discovery warnings
 from vosk import KaldiRecognizer, Model, SetLogLevel
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -290,6 +294,18 @@ class Brain:
 
 # ---------- main loop ----------
 
+def text_mode(questions):
+    """Run questions through the brain without audio: dean.py --ask "..." [--ask "..."]"""
+    if not API_KEY.startswith("sk-or-"):
+        print("No OPENROUTER_API_KEY in ~/.dean.env")
+        return 2
+    brain = Brain()
+    for q in questions:
+        show("you", q)
+        show("dean", brain.ask(q))
+    return 0
+
+
 def main():
     SetLogLevel(-1)
     os.system("clear")
@@ -314,11 +330,14 @@ def main():
     where = brain.tools.place_line()
     show("status", where or "location unknown")
 
+    follow_up = False
     while True:
-        ear.wait_for_wake()
+        if not follow_up:
+            ear.wait_for_wake()
         play(CHIME_WAKE)
         show("status", "listening…")
-        audio = ear.record_command()
+        audio = ear.record_command(max_wait=8.0 if follow_up else 6.0)
+        follow_up = False
         if audio is None:
             show("status", "didn't hear anything")
             play(CHIME_DONE)
@@ -326,7 +345,16 @@ def main():
         segments, _ = whisper.transcribe(audio, beam_size=1, language="en",
                                          vad_filter=True, initial_prompt="Hey Dean,")
         text = " ".join(s.text for s in segments).strip()
-        if not text:
+        if is_just_wake_word(text):
+            # the tail of "hey dean" got recorded; the real question comes next
+            audio = ear.record_command()
+            if audio is None:
+                show("status", "didn't hear anything")
+                play(CHIME_DONE)
+                continue
+            segments, _ = whisper.transcribe(audio, beam_size=1, language="en", vad_filter=True)
+            text = " ".join(s.text for s in segments).strip()
+        if not text or is_just_wake_word(text):
             show("status", "couldn't make that out")
             play(CHIME_DONE)
             continue
@@ -336,9 +364,19 @@ def main():
         show("dean", reply)
         speak(reply)
         mic.start()
+        # if Dean asked something, listen for the answer without needing "hey dean"
+        follow_up = reply.rstrip().endswith("?")
+
+
+def is_just_wake_word(text):
+    words = re.sub(r"[^a-z ]", "", text.lower()).split()
+    return 0 < len(words) <= 2 and set(words) <= {"hey", "hi", "dean", "deen", "dee"}
 
 
 if __name__ == "__main__":
+    if "--ask" in sys.argv:
+        args = sys.argv[1:]
+        sys.exit(text_mode([args[i + 1] for i, a in enumerate(args[:-1]) if a == "--ask"]))
     try:
         sys.exit(main())
     except MicMuted:
