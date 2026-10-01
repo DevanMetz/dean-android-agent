@@ -28,9 +28,13 @@ def termux(*args, timeout=30, stdin=None):
                        text=True, timeout=timeout, input=stdin)
     out = r.stdout.strip()
     try:
-        return json.loads(out) if out else {}
+        result = json.loads(out) if out else {}
     except json.JSONDecodeError:
         return out
+    # Termux:API reports failures (e.g. missing permissions) as {"error": ...} with exit 0
+    if isinstance(result, dict) and "error" in result:
+        raise RuntimeError(result["error"])
+    return result
 
 
 class Toolbox:
