@@ -47,6 +47,7 @@ RATE = 16000
 CHUNK = 1600  # 100 ms of 16-bit mono audio = 3200 bytes
 CHUNK_BYTES = CHUNK * 2
 END_SILENCE = 0.7  # seconds of quiet that mean you've finished talking
+WAKE_CONF = float(os.environ.get("DEAN_WAKE_CONF", "0.85"))  # Vosk word confidence to wake
 
 
 def load_env(path):
@@ -270,6 +271,8 @@ class Listener:
         self.vosk = Model(str(Path(os.environ.get("DEAN_VOSK", "/opt/models/vosk-model-small-en-us-0.15"))))
         grammar = json.dumps(["hey dean", "dean", "hey", "[unk]"])
         self.wake = KaldiRecognizer(self.vosk, RATE, grammar)
+        self.wake.SetWords(True)  # per-word confidence in final results
+        self.attempts = 0
         self.ring = deque(maxlen=25)  # last 2.5 s of audio
 
     def _track(self, data):
@@ -284,9 +287,10 @@ class Listener:
         return level
 
     def wait_for_wake(self):
-        """Vosk spots a possible "hey dean" cheaply; Moonshine then re-reads the last
-        2.5 s and must hear "Dean" too. Vosk alone forces any speech into its tiny
-        grammar, which caused false wake-ups."""
+        """Vosk spots a possible "hey dean" cheaply, then the candidate must pass one of
+        two checks: Vosk was confident in both words, or Moonshine also hears "Dean".
+        Vosk alone forces any speech into its tiny grammar (false wake-ups); Moonshine
+        alone often returns nothing for a short, quiet "hey dean" (missed wake-ups)."""
         self.wake.Reset()
         self.ring.clear()
         while True:
@@ -294,17 +298,47 @@ class Listener:
             self.ring.append(data)
             level = self._track(data)
             self.noise = 0.97 * self.noise + 0.03 * min(level, self.noise * 2 + 50)
-            if self.wake.AcceptWaveform(data):
-                heard = json.loads(self.wake.Result()).get("text", "")
+            final = self.wake.AcceptWaveform(data)
+            if final:
+                result = json.loads(self.wake.Result())
+                heard = result.get("text", "")
             else:
                 heard = json.loads(self.wake.PartialResult()).get("partial", "")
-            if any(p in heard for p in WAKE_PHRASES):
-                self.wake.Reset()
-                text = self.transcribe(recent_audio(self.ring), save=False)
-                if SAID_DEAN.search(text.lower()):
-                    return
-                show("status", f"ignored a false wake-up (heard \"{text}\")")
-                self.ring.clear()
+            if not any(p in heard for p in WAKE_PHRASES):
+                continue
+            # wait (briefly) for Vosk's final result, which carries word confidences
+            waited = 0
+            while not final and waited < 12:  # up to 1.2 s
+                data = self.mic.read()
+                self.ring.append(data)
+                waited += 1
+                final = self.wake.AcceptWaveform(data)
+            result = json.loads(self.wake.Result() if final else self.wake.FinalResult())
+            self.wake.Reset()
+            conf = {}
+            for w in result.get("result", []):
+                conf[w["word"]] = max(conf.get(w["word"], 0), w["conf"])
+            sure = conf.get("hey", 0) >= WAKE_CONF and conf.get("dean", 0) >= WAKE_CONF
+            text = "" if sure else self.transcribe(recent_audio(self.ring), save=False)
+            ok = sure or bool(SAID_DEAN.search(text.lower()))
+            self.log_attempt(conf, text, ok)
+            if ok:
+                return
+            show("status", f"ignored a possible wake-up (confidence {conf.get('dean', 0):.2f}, "
+                           f"heard \"{text}\")")
+            self.ring.clear()
+
+    def log_attempt(self, conf, text, ok):
+        """Keep the last 30 wake attempts (audio + scores) in /tmp for tuning."""
+        self.attempts += 1
+        n = self.attempts % 30
+        try:
+            save_last_command(recent_audio(self.ring), Path(f"/tmp/dean-wake-{n:02d}.wav"))
+            with open("/tmp/dean-wake-log.txt", "a") as f:
+                f.write(f"{datetime.now():%H:%M:%S} #{n:02d} {'WAKE' if ok else 'reject'} "
+                        f"conf={json.dumps(conf)} moonshine={text!r}\n")
+        except OSError:
+            pass
 
     def record_command(self, max_wait=6.0, max_len=15.0, end_silence=None):
         """Record until the speaker pauses. Returns float32 audio or None."""
@@ -382,9 +416,9 @@ class Interrupter(threading.Thread):
 LAST_COMMAND = Path("/tmp/dean-last-command.wav")  # newest command only, for debugging
 
 
-def save_last_command(audio):
+def save_last_command(audio, path=LAST_COMMAND):
     try:
-        with wave.open(str(LAST_COMMAND), "wb") as w:
+        with wave.open(str(path), "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
             w.setframerate(RATE)
@@ -423,6 +457,7 @@ class Transcriber:
 
 TOOL_STATUS = {"web_search": "searching the web…", "look": "taking a photo…",
                "get_weather": "checking the weather…", "lights": "lights…",
+               "find_phone": "ringing your phone…",
                "get_location": "checking location…", "read_sensors": "reading sensors…"}
 
 

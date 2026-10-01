@@ -6,3 +6,7 @@ snap.jpg
 __pycache__/
 *.pyc
 lights.json
+android/dean-finder/topic.secret
+android/dean-finder/build/
+android/dean-finder/*.apk
+android/dean-finder/*.keystore

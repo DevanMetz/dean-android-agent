@@ -6,12 +6,15 @@ import base64
 import io
 import json
 import math
+import os
+import smtplib
 import socket
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from email.message import EmailMessage
 from pathlib import Path
 
 import httpx
@@ -258,6 +261,45 @@ class Toolbox:
         with ThreadPoolExecutor(len(hits)) as pool:
             return list(pool.map(one, hits))
 
+    # ----- finding phones -----
+
+    def find_phone(self, phone, stop=False):
+        p = phone.lower()
+        if any(w in p for w in ("pixel", "android", "google")):
+            topic = os.environ.get("DEAN_PIXEL_TOPIC")
+            if not topic:
+                return {"error": "the Pixel isn't set up yet (DEAN_PIXEL_TOPIC missing)"}
+            # the Dean Finder app on the Pixel listens on this private ntfy channel
+            r = httpx.post(f"https://ntfy.sh/{topic}", content="stop" if stop else "ring", timeout=10)
+            r.raise_for_status()
+            return {"phone": "Pixel", "ringing": not stop,
+                    "note": "" if stop else "rings at full alarm volume for up to a minute"}
+        if any(w in p for w in ("iphone", "apple", "ios")):
+            if stop:
+                return {"note": "the iPhone stops by itself when its shortcut finishes"}
+            return self.ring_iphone()
+        return {"error": f"unknown phone {phone!r}; expected the Pixel or the iPhone"}
+
+    def ring_iphone(self):
+        """Email the iPhone; a Shortcuts automation on it ("when I get an email with
+        this subject") turns the volume up and makes noise, even on silent."""
+        need = ("DEAN_SMTP_HOST", "DEAN_SMTP_USER", "DEAN_SMTP_PASSWORD", "DEAN_IPHONE_EMAIL")
+        missing = [k for k in need if not os.environ.get(k)]
+        if missing:
+            return {"error": "the iPhone isn't set up yet (missing " + ", ".join(missing) + ")"}
+        msg = EmailMessage()
+        msg["From"] = os.environ["DEAN_SMTP_USER"]
+        msg["To"] = os.environ["DEAN_IPHONE_EMAIL"]
+        msg["Subject"] = os.environ.get("DEAN_IPHONE_SUBJECT", "Dean find my iPhone")
+        msg.set_content("Dean is looking for your iPhone.")
+        host = os.environ["DEAN_SMTP_HOST"]
+        with smtplib.SMTP(host, int(os.environ.get("DEAN_SMTP_PORT", "587")), timeout=20) as s:
+            s.starttls()
+            s.login(os.environ["DEAN_SMTP_USER"], os.environ["DEAN_SMTP_PASSWORD"])
+            s.send_message(msg)
+        return {"phone": "iPhone", "ringing": True,
+                "note": "the iPhone gets the email in a few seconds, then its shortcut plays sound"}
+
     # ----- weather -----
 
     WMO = {0: "clear", 1: "mostly clear", 2: "partly cloudy", 3: "overcast", 45: "fog",
@@ -356,6 +398,11 @@ TOOLS = [
                       "description": "White color temperature: ~2700 warm, ~4000 neutral, "
                                      "~6500 daylight."}},
           ["target"]),
+    _tool("find_phone", "Make the person's phone ring loudly so they can find it (works even "
+          "when it's on silent). Also stops the Pixel ringing.",
+          {"phone": {"type": "string", "enum": ["pixel", "iphone"]},
+           "stop": {"type": "boolean", "description": "Stop ringing instead."}},
+          ["phone"]),
     _tool("get_location", "Get the tablet's current location (city, state, coordinates).",
           {"refresh": {"type": "boolean", "description": "Force a fresh location fix."}}),
     _tool("look", "Take a photo with the tablet camera and answer a question about it. Only use "

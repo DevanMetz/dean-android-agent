@@ -18,6 +18,7 @@ The model gets these tools and decides when to use them:
 | `web_search` | Current info such as weather, news, scores and hours (OpenRouter web plugin) |
 | `get_weather` | Current conditions and 1–7 day forecast from [Open-Meteo](https://open-meteo.com), free with no key, ~0.3 s |
 | `lights` | Govee lights: on/off, brightness, color, warm/cool white, or current state. Uses the LAN API where enabled (~50 ms) and the Govee cloud API otherwise |
+| `find_phone` | Rings the Pixel through the Dean Finder app, or the iPhone through an email-triggered Shortcut. Both ring even on silent |
 | `get_location` | City and coordinates from Android network location, reverse-geocoded once a day with OpenStreetMap |
 | `look` | Takes a photo with the front or back camera and answers a question about it. Chimes whenever the camera is used, and photos are deleted right away |
 | `read_sensors` | Room light level, tablet orientation, proximity |
@@ -106,6 +107,17 @@ Dean watches this file and starts as soon as a valid key appears.
 3. List LAN lights in `~/assistant/lights.json` (see `lights.example.json`). Give each light a fixed IP in your router so the address doesn't change.
 
 To find LAN lights, send `{"msg":{"cmd":"devStatus","data":{}}}` over UDP to port 4003 on each address and listen on port 4002. Android may filter Govee's multicast scan replies, but these direct replies get through.
+
+## Finding phones
+
+**Android: the Dean Finder app** (`android/dean-finder`, about 25 KB, plain Java, no libraries)
+- A foreground service keeps a connection open to a private [ntfy](https://ntfy.sh) channel. On `ring`, it plays the phone's alarm sound on the alarm stream at full volume, which works even in silent or vibrate mode. It also vibrates and blinks the flashlight until you tap Stop, for 60 seconds at most. `stop` ends it remotely.
+- To build it: put a long random channel name in `android/dean-finder/topic.secret`, then run `android/dean-finder/build.sh`. It needs JDK 17 and the Android SDK with `platforms;android-36` and `build-tools;36.1.0`, but not Gradle.
+- Install it with `adb install -r -g dean-finder.apk`, open it once, and tap **Let it run in the background**. Then set `DEAN_PIXEL_TOPIC=<same channel name>` in `~/.dean.env`.
+
+**iPhone: Shortcuts automation** (an iPhone can't run third-party background listeners without the App Store)
+- Dean emails the iPhone. A Shortcuts automation that runs when an email with that subject arrives turns the volume up and speaks or vibrates.
+- Set `DEAN_SMTP_HOST`, `DEAN_SMTP_USER`, `DEAN_SMTP_PASSWORD` (an app password), `DEAN_IPHONE_EMAIL` and, optionally, `DEAN_IPHONE_SUBJECT` in `~/.dean.env`. Use an address that Apple Mail on the iPhone gets by **push**, such as iCloud Mail, so the email arrives within seconds.
 
 ## Development
 
