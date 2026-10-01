@@ -24,7 +24,9 @@ The model gets these tools and decides when to use them:
 | `read_sensors` | Room light level, tablet orientation, proximity |
 | `device_status` | Battery, charging, temperature, Wi-Fi signal, volume |
 | `set_volume`, `set_brightness`, `flashlight` | Device controls |
-| `set_timer`, `list_timers`, `cancel_timer` | Spoken timers |
+| `set_timer`, `set_reminder`, `set_alarm`, `list_scheduled`, `cancel_scheduled` | Timers, reminders (one-off or daily/weekdays/weekends/weekly) and wake-up alarms. Saved to `schedule.json`, so they survive restarts |
+| `create_routine`, `run_routine`, `schedule_routine`, `list_routines`, `remove_routine` | Named routines: plain-English steps Dean carries out with its tools, e.g. "good night: turn off all lights, set a 7 AM weekday alarm". They can run on a schedule or when an alarm goes off |
+| `announce` | Say something out loud at home (only when texting) |
 | `remember`, `forget` | Long-term memory, stored on the tablet in `memory.json` |
 
 Conversations carry over for 3 minutes, so follow-ups like "what about tomorrow?" work.
@@ -36,6 +38,9 @@ Conversations carry over for 3 minutes, so follow-ups like "what about tomorrow?
 | `dean.py` | `~/assistant/dean.py`: main loop (audio, wake word, STT, LLM tool loop, TTS) |
 | `tools.py` | `~/assistant/tools.py`: tool implementations (Termux:API) |
 | `govee.py` | `~/assistant/govee.py`: Govee light control (LAN and cloud) |
+| `scheduler.py` | `~/assistant/scheduler.py`: reminders, alarms, timers, routines |
+| `telegram_bot.py` | `~/assistant/telegram_bot.py`: text Dean from your phone |
+| `dashboard.py` | `~/assistant/dashboard.py`: full-screen wall display |
 | `termux/bridge.py` | `~/assistant/bridge.py`: runs Termux:API commands natively for Dean (~0.35 s vs ~2.5 s through proot) |
 | `run.sh` | `~/assistant/run.sh`: supervisor that restarts audio and Dean |
 | `termux/boot-01-services` | `~/.termux/boot/01-services`: runs at boot through Termux:Boot |
@@ -107,6 +112,18 @@ Dean watches this file and starts as soon as a valid key appears.
 3. List LAN lights in `~/assistant/lights.json` (see `lights.example.json`). Give each light a fixed IP in your router so the address doesn't change.
 
 To find LAN lights, send `{"msg":{"cmd":"devStatus","data":{}}}` over UDP to port 4003 on each address and listen on port 4002. Android may filter Govee's multicast scan replies, but these direct replies get through.
+
+## Wall dashboard
+
+The Termux screen shows a big clock, the date, the current weather and today's forecast, light status (with unreachable lights marked offline), the next three reminders or alarms, and the recent conversation. A status bar at the bottom shows what Dean is doing. Set `DEAN_DASHBOARD=0` to get the plain scrolling log back.
+
+## Texting Dean (Telegram)
+
+1. In Telegram, message **@BotFather**, send `/newbot`, and follow the prompts.
+2. Add `TELEGRAM_BOT_TOKEN=<token>` to `~/.dean.env` and restart Dean.
+3. Message your bot. It refuses unknown chats and tells you your chat ID, which also appears on the tablet. Add `TELEGRAM_ALLOWED_CHATS=<id>` (comma-separate several IDs) and restart.
+
+Each chat keeps its own conversation. Reminders set by text are texted back to you, and `announce` speaks at home. The camera is off over text so nobody at home is photographed without knowing; set `DEAN_TELEGRAM_CAMERA=1` to allow it.
 
 ## Finding phones
 

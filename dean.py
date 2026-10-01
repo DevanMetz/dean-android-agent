@@ -40,6 +40,9 @@ from vosk import KaldiRecognizer, Model, SetLogLevel  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tools import TOOLS, Toolbox  # noqa: E402
+from scheduler import Scheduler, routines  # noqa: E402
+from telegram_bot import TelegramBot  # noqa: E402
+from dashboard import Dashboard  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 TERMUX_BIN = "/data/data/com.termux/files/usr/bin"
@@ -93,8 +96,30 @@ SYSTEM = (
     "(\"turn my rims later\" was really \"turn my room's light off\"). Work out what they "
     "most likely said from how it sounds and the context, and act on it. Changing lights, "
     "volume or brightness is harmless and easy to undo, so for those make your best guess and "
-    "do it rather than asking. Never ask which device they mean when only one fits."
+    "do it rather than asking. Never ask which device they mean when only one fits. "
+    "Use your scheduling tools for reminders, alarms, timers and routines; a routine is a "
+    "saved list of steps you carry out with your tools when asked or when it's scheduled."
 )
+
+TEXT_SYSTEM = (
+    "You are Dean, the household's assistant, which lives on a tablet on the living room wall. "
+    "Right now the owner is texting you through Telegram, possibly from away from home. Reply "
+    "in short plain-text messages (no markdown; it isn't rendered). You can control things at "
+    "home with your tools: lights, the tablet, reminders, alarms, routines, phones. To say "
+    "something out loud at home, use announce. Reminders set by text are texted back to them "
+    "unless they ask for them to be said at home. Use get_weather for local weather and "
+    "web_search for anything else current; never guess those. After using a tool, just give "
+    "the answer. Changing lights or volume is harmless, so act rather than asking which device "
+    "when only one fits."
+)
+
+
+def tools_for(channel):
+    """Voice gets everything but announce; text can't use the camera unless allowed, so
+    nobody at home is photographed without knowing."""
+    allow_camera = os.environ.get("DEAN_TELEGRAM_CAMERA") == "1"
+    skip = {"announce"} if channel == "voice" else ({"look"} if not allow_camera else set())
+    return [t for t in TOOLS if t["function"]["name"] not in skip]
 
 
 # ---------- display ----------
@@ -103,9 +128,17 @@ C = {"dim": "\033[2m", "cyan": "\033[36m", "green": "\033[32m", "yellow": "\033[
      "red": "\033[31m", "bold": "\033[1m", "off": "\033[0m"}
 
 
+DASH = None  # Dashboard once the voice loop is running
+
+
 def show(kind, text):
-    color = {"you": "cyan", "dean": "green", "status": "dim", "warn": "yellow", "err": "red"}[kind]
-    label = {"you": "You  ", "dean": "Dean ", "status": "  ·  ", "warn": "  !  ", "err": "  ✗  "}[kind]
+    if DASH:
+        DASH.log(kind, text)
+        return
+    color = {"you": "cyan", "dean": "green", "status": "dim", "warn": "yellow",
+             "err": "red", "text-you": "cyan", "text-dean": "green"}.get(kind, "dim")
+    label = {"you": "You  ", "dean": "Dean ", "status": "  ·  ", "warn": "  !  ", "err": "  ✗  ",
+             "text-you": "You› ", "text-dean": "Dean›"}.get(kind, "  ·  ")
     stamp = datetime.now().strftime("%I:%M %p").lstrip("0")
     print(f"{C['dim']}{stamp:>8}{C['off']} {C[color]}{C['bold'] if kind in ('you', 'dean') else ''}"
           f"{label}{C['off']}{C[color]}{text}{C['off']}", flush=True)
@@ -156,6 +189,13 @@ def tone(freqs, dur=0.09, vol=0.25):
 
 CHIME_WAKE = tone([660, 880])
 CHIME_DONE = tone([880, 660])
+CHIME_ALARM = tone([880, 1175, 880, 1175], dur=0.14, vol=0.35)
+
+
+def state(text):
+    """Bottom status bar on the dashboard."""
+    if DASH:
+        DASH.set_state(text)
 
 
 def play(pcm):
@@ -474,23 +514,24 @@ class APIError(Exception):
 class Brain:
     URL = "https://openrouter.ai/api/v1/chat/completions"
 
-    def __init__(self, say=None):
-        self.http = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0), headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "HTTP-Referer": "https://localhost/dean",
-            "X-Title": "Dean wall assistant",
-        })
-        self.models = list(dict.fromkeys([MODEL, FALLBACK_MODEL]))  # shared with the tools
-        self.tools = Toolbox(self.http, self.models, VISION_MODEL,
-                             say=say or (lambda t: None), chime=lambda: play(CHIME_WAKE))
+    def __init__(self, toolbox=None, channel="voice", chat=None):
+        self.http = openrouter_client()
+        self.tools = toolbox or make_toolbox(self.http)
+        self.models = self.tools.models  # shared, so a model fallback applies everywhere
+        self.channel, self.chat = channel, chat
+        self.tool_specs = tools_for(channel)
         self.messages = []
         self.last = 0.0
 
     def system(self):
-        parts = [SYSTEM, LOCATION and f"The household is in {LOCATION}." or self.tools.place_line()]
+        parts = [SYSTEM if self.channel == "voice" else TEXT_SYSTEM,
+                 LOCATION and f"The household is in {LOCATION}." or self.tools.place_line()]
         names = self.tools.govee.names()
         if names:
             parts.append("Smart lights you can control: " + ", ".join(names) + ".")
+        saved = routines()
+        if saved:
+            parts.append("Saved routines: " + ", ".join(saved) + ".")
         mem = self.tools.memories()
         if mem:
             parts.append("Things you've been asked to remember: " + " | ".join(mem))
@@ -560,7 +601,7 @@ class Brain:
         except json.JSONDecodeError:
             args = {}
         show("status", TOOL_STATUS.get(name, f"{name.replace('_', ' ')}…"))
-        return self.tools.call(name, args)
+        return self.tools.call(name, args, {"channel": self.channel, "chat": self.chat})
 
     def ask(self, text, on_text=lambda t: None, should_stop=lambda: False):
         """Answer `text`, streaming spoken text to on_text as it arrives."""
@@ -585,7 +626,7 @@ class Brain:
                 msg = self.stream_round({
                     "models": self.models,
                     "messages": [{"role": "system", "content": self.system()}] + self.messages,
-                    "tools": TOOLS,
+                    "tools": self.tool_specs,
                     "max_tokens": 4000,
                     "reasoning": {"effort": EFFORT},
                     "stream": True,
@@ -633,6 +674,96 @@ class Brain:
         return "".join(spoken).strip()
 
 
+def openrouter_client():
+    return httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0), headers={
+        "Authorization": f"Bearer {API_KEY}",
+        "HTTP-Referer": "https://localhost/dean",
+        "X-Title": "Dean wall assistant",
+    })
+
+
+def make_toolbox(http, say=None):
+    return Toolbox(http, list(dict.fromkeys([MODEL, FALLBACK_MODEL])), VISION_MODEL,
+                   say=say or (lambda t: None), chime=lambda: play(CHIME_WAKE))
+
+
+class Home:
+    """What Dean does unprompted: reminders, timers, alarms and scheduled routines."""
+
+    def __init__(self, voice, toolbox):
+        self.voice, self.tb = voice, toolbox
+        self.bot = None
+        self.alarm_stop = threading.Event()
+        self.alarm_ringing = False
+        self.current = None  # utterance being spoken by the alarm
+        self.bg = Brain(toolbox=toolbox, channel="voice")  # its own conversation history
+        self.bg_lock = threading.Lock()
+
+    def fire(self, item):
+        kind, text = item["kind"], item.get("text") or ""
+        if kind == "alarm":
+            return self.ring_alarm(item)
+        if kind == "routine":
+            return self.run_routine(item["routine"], item)
+        if kind == "timer":
+            msg = "Your timer is done." if text in ("", "timer") else f"Your {text} timer is done."
+        else:
+            msg = f"Reminder: {text.rstrip('.')}."
+        show("status", msg)
+        self.notify(item, msg)
+        if item.get("speak", True):
+            for _ in range(3):
+                play(CHIME_WAKE)
+            self.voice.speak(msg)
+
+    def notify(self, item, text):
+        if self.bot and item.get("notify"):
+            try:
+                self.bot.send(item["notify"], text)
+            except Exception as e:
+                show("warn", f"Telegram: {e}")
+
+    def ring_alarm(self, item):
+        label = item.get("text") or "alarm"
+        show("status", f"alarm: {label}  (say \"hey Dean\" to stop)")
+        state("⏰ Alarm, say \"hey Dean\" to stop")
+        self.notify(item, f"Alarm: {label}")
+        self.alarm_stop.clear()
+        self.alarm_ringing = True
+        end = time.time() + 300  # give up after 5 minutes
+        while not self.alarm_stop.is_set() and time.time() < end:
+            for _ in range(3):
+                play(CHIME_ALARM)
+            when = datetime.now().strftime("%I:%M").lstrip("0")
+            what = "Time to wake up" if label.lower() == "alarm" else label.rstrip(".")
+            self.current = self.voice.utterance()
+            self.current.feed(f"It's {when}. {what}. Say hey Dean to turn this off.")
+            self.current.finish()
+            self.alarm_stop.wait(10)
+        self.alarm_ringing = False
+        state('Say "hey Dean"')
+        if item.get("routine"):
+            self.run_routine(item["routine"], item)
+
+    def stop_alarm(self):
+        """Called when someone says "hey Dean" while the alarm rings."""
+        if not self.alarm_ringing:
+            return False
+        self.alarm_stop.set()
+        if self.current:
+            self.current.cancel()
+        return True
+
+    def run_routine(self, name, item=None):
+        show("status", f"running routine: {name}")
+        with self.bg_lock:
+            reply = self.bg.ask(f"Run my '{name}' routine now.")
+        if reply:
+            show("dean", reply)
+            self.notify(item or {}, f"{name}: {reply}")
+            self.voice.speak(reply)
+
+
 # ---------- main loop ----------
 
 def text_mode(questions):
@@ -641,6 +772,7 @@ def text_mode(questions):
         print("No OPENROUTER_API_KEY in ~/.dean.env")
         return 2
     brain = Brain()
+    brain.tools.scheduler = Scheduler(run=False)  # the live Dean process does the firing
     for q in questions:
         show("you", q)
         t0, first = time.time(), []
@@ -652,6 +784,7 @@ def text_mode(questions):
 
 
 def main():
+    global DASH
     SetLogLevel(-1)
     os.system("clear")
     print(f"{C['bold']}{C['green']}  DEAN{C['off']}{C['dim']}  ·  say \"hey dean\"{C['off']}\n")
@@ -671,16 +804,35 @@ def main():
     mic = Mic()
     mic.start()
     ear = Listener(mic, transcribe)
-    brain = Brain(say=voice.speak)
-    show("status", f"ready  ({MODEL}, effort {EFFORT})")
-    where = brain.tools.place_line()
+    toolbox = make_toolbox(openrouter_client(), say=voice.speak)
+    brain = Brain(toolbox=toolbox, channel="voice")
+    home = Home(voice, toolbox)
+    toolbox.scheduler = Scheduler(on_fire=home.fire)
+    if os.environ.get("DEAN_DASHBOARD", "1") == "1":
+        DASH = Dashboard(toolbox)
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if token:
+        allowed = {int(x) for x in os.environ.get("TELEGRAM_ALLOWED_CHATS", "").replace(" ", "")
+                   .split(",") if x.lstrip("-").isdigit()}
+        home.bot = TelegramBot(token, allowed, log=show, make_brain=lambda chat: Brain(
+            toolbox=toolbox, channel="telegram", chat=chat))
+        home.bot.start()
+    show("status", f"ready  ({MODEL}, effort {EFFORT})"
+                   + ("  ·  Telegram on" if token else ""))
+    where = toolbox.place_line()
     show("status", where or "location unknown")
 
     follow_up = False
     while True:
+        state('Say "hey Dean"')
         if not follow_up:
             ear.wait_for_wake()
+            if home.stop_alarm():
+                show("status", "alarm off")
+                play(CHIME_DONE)
+                continue
         play(CHIME_WAKE)
+        state("Listening…")
         show("status", "listening…")
         audio = ear.record_command(max_wait=8.0 if follow_up else 6.0)
         follow_up = False
@@ -705,6 +857,7 @@ def main():
             continue
         stt = time.time() - heard
         show("you", text)
+        state("Thinking…")
         utt = voice.utterance()
         barge = Interrupter(ear, utt)  # "stop" / "hey dean" cut Dean off
         barge.start()

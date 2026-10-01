@@ -5,6 +5,7 @@ JSON-serialisable; TOOLS holds the schemas sent to the model."""
 import base64
 import io
 import json
+import inspect
 import math
 import os
 import smtplib
@@ -21,6 +22,7 @@ import httpx
 from PIL import Image
 
 from govee import Govee, parse_color
+from scheduler import delete_routine, routines, save_routine
 
 TERMUX_BIN = "/data/data/com.termux/files/usr/bin"
 DATA = Path("/data/data/com.termux/files/home/assistant")
@@ -68,8 +70,8 @@ class Toolbox:
         self.vision_model = vision_model  # used for camera questions
         self.say = say  # speak(text) - used by timers
         self.chime = chime
-        self.timers = {}
         self.lock = threading.Lock()
+        self.scheduler = None  # set by dean.py once speech is ready
         self.govee = Govee()
 
     # ----- location -----
@@ -185,37 +187,74 @@ class Toolbox:
         termux("termux-torch", "on" if on else "off")
         return {"flashlight": "on" if on else "off"}
 
-    # ----- timers -----
+    # ----- reminders, alarms, timers, routines (see scheduler.py) -----
 
-    def set_timer(self, minutes, label="timer"):
-        due = datetime.now() + timedelta(minutes=minutes)
-        tid = f"{label}-{due.strftime('%H%M%S')}"
+    @staticmethod
+    def _when(when=None, in_minutes=None):
+        if in_minutes is not None:
+            return datetime.now() + timedelta(minutes=float(in_minutes))
+        if when:
+            return datetime.fromisoformat(when.strip().replace("Z", "").replace(" ", "T"))
+        raise ValueError("give 'when' (local time, e.g. 2026-10-01T19:00) or 'in_minutes'")
 
-        def fire():
-            with self.lock:
-                self.timers.pop(tid, None)
-            for _ in range(3):
-                self.chime()
-            self.say(f"Your {label} is done." if label != "timer" else "Your timer is done.")
+    @staticmethod
+    def _where(ctx, announce_at_home):
+        """Reminders set by text go back to that chat; spoken at home unless set remotely."""
+        ctx = ctx or {}
+        texted = ctx.get("channel") == "telegram"
+        speak = (not texted) if announce_at_home is None else bool(announce_at_home)
+        return {"notify": ctx.get("chat") if texted else None, "speak": speak}
 
-        t = threading.Timer(minutes * 60, fire)
-        t.daemon = True
-        with self.lock:
-            self.timers[tid] = (t, due, label)
-        t.start()
-        return {"set": label, "goes_off_at": due.strftime("%I:%M:%S %p")}
+    def set_reminder(self, text, when=None, in_minutes=None, repeat="none",
+                     announce_at_home=None, _ctx=None):
+        return self.scheduler.add("reminder", self._when(when, in_minutes), text=text,
+                                  repeat=repeat, **self._where(_ctx, announce_at_home))
 
-    def list_timers(self):
-        with self.lock:
-            return [{"label": l, "remaining_seconds": int((d - datetime.now()).total_seconds())}
-                    for _, d, l in self.timers.values()]
+    def set_timer(self, minutes, label="timer", _ctx=None):
+        return self.scheduler.add("timer", self._when(in_minutes=minutes), text=label,
+                                  **self._where(_ctx, None))
 
-    def cancel_timer(self, label):
-        with self.lock:
-            hits = [k for k, (_, _, l) in self.timers.items() if label.lower() in l.lower()]
-            for k in hits:
-                self.timers.pop(k)[0].cancel()
-        return {"cancelled": len(hits)}
+    def set_alarm(self, when, repeat="none", label="alarm", routine=None, _ctx=None):
+        if routine and routine.lower().strip() not in routines():
+            return {"error": f"no routine called {routine!r}", "routines": list(routines())}
+        return self.scheduler.add("alarm", self._when(when), text=label, repeat=repeat,
+                                  routine=routine, notify=self._where(_ctx, None)["notify"])
+
+    def schedule_routine(self, routine, when, repeat="none", _ctx=None):
+        if routine.lower().strip() not in routines():
+            return {"error": f"no routine called {routine!r}", "routines": list(routines())}
+        return self.scheduler.add("routine", self._when(when), text=routine, repeat=repeat,
+                                  routine=routine, notify=self._where(_ctx, None)["notify"])
+
+    def list_scheduled(self):
+        return self.scheduler.upcoming() or {"note": "nothing scheduled"}
+
+    def cancel_scheduled(self, match):
+        gone = self.scheduler.cancel(match)
+        return {"cancelled": gone} if gone else {"error": f"nothing scheduled matches {match!r}"}
+
+    def create_routine(self, name, steps):
+        save_routine(name, steps)
+        return {"saved": name, "steps": steps}
+
+    def run_routine(self, name):
+        r = routines()
+        steps = r.get(name.lower().strip())
+        if steps is None:
+            return {"error": f"no routine called {name!r}", "routines": list(r)}
+        return {"routine": name, "steps": steps,
+                "instructions": "Carry out each step now with your tools, then confirm briefly."}
+
+    def list_routines(self):
+        return routines() or {"note": "no routines yet"}
+
+    def remove_routine(self, name):
+        return {"deleted": delete_routine(name)}
+
+    def announce(self, text):
+        """Say something out loud on the tablet at home."""
+        threading.Thread(target=self.say, args=(text,), daemon=True).start()
+        return {"announced": text}
 
     # ----- memory -----
 
@@ -360,10 +399,13 @@ class Toolbox:
 
     # ----- dispatch -----
 
-    def call(self, name, args):
+    def call(self, name, args, ctx=None):
         fn = getattr(self, name, None)
         if name not in TOOL_NAMES or fn is None:
             return {"error": f"unknown tool {name}"}
+        args = {k: v for k, v in args.items() if not k.startswith("_")}
+        if "_ctx" in inspect.signature(fn).parameters:
+            args["_ctx"] = ctx
         try:
             return fn(**args)
         except Exception as e:  # report failures to the model instead of crashing
@@ -421,12 +463,41 @@ TOOLS = [
     _tool("flashlight", "Turn the camera flashlight on or off.",
           {"on": {"type": "boolean"}}, ["on"]),
     _tool("set_timer", "Start a countdown timer that chimes and speaks when done.",
-          {"minutes": {"type": "number"}, "label": {"type": "string",
-                                                     "description": "Short name, e.g. 'pasta'."}},
+          {"minutes": {"type": "number"},
+           "label": {"type": "string", "description": "Short name, e.g. 'pasta'."}},
           ["minutes"]),
-    _tool("list_timers", "List running timers and time remaining."),
-    _tool("cancel_timer", "Cancel timers whose label matches.",
-          {"label": {"type": "string"}}, ["label"]),
+    _tool("set_reminder", "Remind the person about something at a time (optionally repeating). "
+          "Reminders set by voice are spoken at home; set by text, they're texted back.",
+          {"text": {"type": "string", "description": "What to remind them, e.g. 'take out the trash'."},
+           "when": {"type": "string", "description": "Local date and time, e.g. 2026-10-01T19:00. Work it out from the current local time you were given."},
+           "in_minutes": {"type": "number", "description": "Alternative to 'when'."},
+           "repeat": {"type": "string", "enum": ["none", "daily", "weekdays", "weekends", "weekly"]},
+           "announce_at_home": {"type": "boolean",
+                                "description": "Also say it out loud at home (for text requests)."}},
+          ["text"]),
+    _tool("set_alarm", "Wake-up alarm: rings and speaks at home until someone says 'hey Dean' "
+          "(or a few minutes pass). Can run a routine when it goes off.",
+          {"when": {"type": "string", "description": "Local date and time, e.g. 2026-10-01T19:00. Work it out from the current local time you were given."}, "repeat": {"type": "string", "enum": ["none", "daily", "weekdays", "weekends", "weekly"]},
+           "label": {"type": "string"},
+           "routine": {"type": "string", "description": "Name of a routine to run, e.g. 'good morning'."}},
+          ["when"]),
+    _tool("schedule_routine", "Run a saved routine automatically at a time, e.g. 'good night' every "
+          "day at 11 PM.",
+          {"routine": {"type": "string"}, "when": {"type": "string", "description": "Local date and time, e.g. 2026-10-01T19:00. Work it out from the current local time you were given."}, "repeat": {"type": "string", "enum": ["none", "daily", "weekdays", "weekends", "weekly"]}},
+          ["routine", "when"]),
+    _tool("list_scheduled", "List upcoming reminders, alarms, timers and scheduled routines."),
+    _tool("cancel_scheduled", "Cancel scheduled items whose text, routine, kind ('timer', 'alarm', "
+          "'reminder') or id matches; 'all' cancels everything.",
+          {"match": {"type": "string"}}, ["match"]),
+    _tool("create_routine", "Save (or replace) a named routine: plain-English steps you'll carry out "
+          "with your tools when it runs, e.g. 'turn off all lights; set an alarm for 7 AM weekdays'.",
+          {"name": {"type": "string"}, "steps": {"type": "string"}}, ["name", "steps"]),
+    _tool("run_routine", "Get a saved routine's steps so you can carry them out now.",
+          {"name": {"type": "string"}}, ["name"]),
+    _tool("list_routines", "List saved routines and their steps."),
+    _tool("remove_routine", "Delete a saved routine.", {"name": {"type": "string"}}, ["name"]),
+    _tool("announce", "Say something out loud on the tablet at home (for when the person is "
+          "texting from elsewhere).", {"text": {"type": "string"}}, ["text"]),
     _tool("remember", "Save a lasting fact about the household or the person's preferences "
           "(names, birthdays, likes, routines). Use when asked to remember something.",
           {"fact": {"type": "string"}}, ["fact"]),
