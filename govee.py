@@ -16,6 +16,7 @@ With an API key, cloud devices missing from the file are added automatically.
 import json
 import os
 import socket
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -109,9 +110,12 @@ class Govee:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.sendto(json.dumps({"msg": {"cmd": cmd, "data": data}}).encode(), (ip, 4003))
 
+    # every light replies to port 4002, which only one socket can receive on at a time
+    _status_lock = threading.Lock()
+
     @staticmethod
     def lan_status(ip, timeout=1.5):
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as rx:
+        with Govee._status_lock, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as rx:
             rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             rx.bind(("", 4002))
             rx.settimeout(timeout)

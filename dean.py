@@ -447,8 +447,13 @@ class Brain:
         spoken = []
 
         def emit(t):
+            if spoken and not spoken[-1][-1:].isspace() and not t[:1].isspace() and new_round[0]:
+                t = " " + t  # text from a later round shouldn't run into the earlier sentence
+            new_round[0] = False
             spoken.append(t)
             on_text(t)
+
+        new_round = [False]
 
         try:
             for _ in range(6):  # model may chain a few tool calls before answering
@@ -460,6 +465,7 @@ class Brain:
                     "reasoning": {"effort": EFFORT},
                     "stream": True,
                 }, emit)
+                new_round[0] = True
                 self.messages.append(msg)
                 calls = msg.get("tool_calls") or []
                 if not calls:
