@@ -21,7 +21,9 @@ from pathlib import Path
 import httpx
 from PIL import Image
 
+import briefing
 from govee import Govee, parse_color
+from roku import INPUTS, KEYS, Roku, RokuError
 from scheduler import delete_routine, routines, save_routine
 
 TERMUX_BIN = "/data/data/com.termux/files/usr/bin"
@@ -75,6 +77,7 @@ class Toolbox:
         self.lock = threading.Lock()
         self.scheduler = None  # set by dean.py once speech is ready
         self.govee = Govee()
+        self._roku = None
 
     # ----- location -----
 
@@ -341,6 +344,46 @@ class Toolbox:
         return {"phone": "iPhone", "ringing": True,
                 "note": "the iPhone gets the email in a few seconds, then its shortcut plays sound"}
 
+    # ----- calendar & news (briefing.py) -----
+
+    def calendar_events(self, day="today", days=1):
+        return briefing.events(briefing.parse_day(day), max(1, min(int(days), 14)))
+
+    def news_headlines(self, topic=None, count=5):
+        return briefing.headlines(topic, max(1, min(int(count), 10)))
+
+    # ----- Roku TV -----
+
+    def tv(self, action, app=None, text=None, times=1):
+        self._roku = self._roku or Roku()
+        tv = self._roku
+        try:
+            if action == "status":
+                return tv.status()
+            if action == "apps":
+                return {"apps": sorted(tv.apps())}
+            if action == "launch":
+                return {"opened": tv.launch(app or text or "")}
+            if action == "search":
+                tv.search(text or app or "")
+                return {"searched_for": text or app}
+            if action == "type":
+                tv.type_text(text or "")
+                return {"typed": text}
+            if action == "input":
+                key = INPUTS.get((text or "").lower().replace(" ", ""))
+                if not key:
+                    return {"error": f"unknown input {text!r}", "inputs": list(INPUTS)}
+                tv.press(key)
+                return {"input": text}
+            key = KEYS.get(action)
+            if not key:
+                return {"error": f"unknown action {action!r}"}
+            tv.press(key, times)
+            return {"done": action, "times": times}
+        except RokuError as e:
+            return {"error": str(e)}
+
     # ----- Bluetooth thermometers (via the Dean Sensors app) -----
 
     def climate_sensors(self):
@@ -474,6 +517,27 @@ TOOLS = [
           {"phone": {"type": "string", "enum": ["pixel", "iphone"]},
            "stop": {"type": "boolean", "description": "Stop ringing instead."}},
           ["phone"]),
+    _tool("calendar_events", "Events from the household's calendars for a day (or several).",
+          {"day": {"type": "string",
+                   "description": "'today', 'tomorrow', a weekday name, or YYYY-MM-DD."},
+           "days": {"type": "integer", "minimum": 1, "maximum": 14}}),
+    _tool("news_headlines", "Current news headlines, top stories or about a topic. Faster than "
+          "web_search for 'what's in the news'.",
+          {"topic": {"type": "string", "description": "Optional, e.g. 'Milwaukee Bucks'."},
+           "count": {"type": "integer", "minimum": 1, "maximum": 10}}),
+    _tool("tv", "Control the Roku TV: power, volume, open apps (Netflix, YouTube...), play/pause, "
+          "navigate, search for a show, switch inputs, or check what's on.",
+          {"action": {"type": "string", "enum": [
+              "status", "on", "off", "volume_up", "volume_down", "mute", "launch", "apps",
+              "search", "type", "play_pause", "rewind", "fast_forward", "replay", "home", "back",
+              "select", "up", "down", "left", "right", "channel_up", "channel_down", "input", "info"]},
+           "app": {"type": "string", "description": "App name for 'launch', e.g. Netflix."},
+           "text": {"type": "string",
+                    "description": "Show/movie for 'search', text for 'type', or input name for "
+                                   "'input' (hdmi1-4, antenna)."},
+           "times": {"type": "integer", "minimum": 1, "maximum": 30,
+                     "description": "Repeat count, e.g. volume_up 5 times for 'a lot louder'."}},
+          ["action"]),
     _tool("climate_sensors", "Temperature, humidity and battery from the household's Govee "
           "Bluetooth thermometers (e.g. the one on the balcony). Use for 'how warm is it on the "
           "balcony'; use get_weather for the forecast.",),

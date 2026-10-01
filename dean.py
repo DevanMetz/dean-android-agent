@@ -40,7 +40,8 @@ from vosk import KaldiRecognizer, Model, SetLogLevel  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tools import TOOLS, Toolbox  # noqa: E402
-from scheduler import Scheduler, routines  # noqa: E402
+from scheduler import Scheduler, routines, save_routine  # noqa: E402
+from briefing import GOOD_MORNING, GOOD_NIGHT  # noqa: E402
 from telegram_bot import TelegramBot  # noqa: E402
 from dashboard import Dashboard  # noqa: E402
 
@@ -98,7 +99,8 @@ SYSTEM = (
     "volume or brightness is harmless and easy to undo, so for those make your best guess and "
     "do it rather than asking. Never ask which device they mean when only one fits. "
     "Use your scheduling tools for reminders, alarms, timers and routines; a routine is a "
-    "saved list of steps you carry out with your tools when asked or when it's scheduled."
+    "saved list of steps you carry out with your tools when asked or when it's scheduled. "
+    "When someone says good morning or good night, run that routine."
 )
 
 TEXT_SYSTEM = (
@@ -807,6 +809,9 @@ def main():
     toolbox = make_toolbox(openrouter_client(), say=voice.speak)
     brain = Brain(toolbox=toolbox, channel="voice")
     home = Home(voice, toolbox)
+    for name, steps in (("good morning", GOOD_MORNING), ("good night", GOOD_NIGHT)):
+        if name not in routines():  # built-in defaults; edit or replace them by voice
+            save_routine(name, steps)
     toolbox.scheduler = Scheduler(on_fire=home.fire)
     if os.environ.get("DEAN_DASHBOARD", "1") == "1":
         DASH = Dashboard(toolbox)

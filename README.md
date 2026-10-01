@@ -20,6 +20,9 @@ The model gets these tools and decides when to use them:
 | `lights` | Govee lights: on/off, brightness, color, warm/cool white, or current state. Uses the LAN API where enabled (~50 ms) and the Govee cloud API otherwise |
 | `find_phone` | Rings the Pixel through the Dean Finder app, or the iPhone through an email-triggered Shortcut. Both ring even on silent |
 | `climate_sensors` | Temperature, humidity and battery from Govee Bluetooth thermometers (H5075 and similar), read by the Dean Sensors app |
+| `tv` | Roku TV over the local network: power, volume, apps, playback, navigation, search, inputs, status |
+| `calendar_events` | Events from private iCal feeds (Google, iCloud, Outlook) set in `DEAN_CALENDARS` |
+| `news_headlines` | Top stories (NPR) or headlines on a topic (Google News RSS) |
 | `get_location` | City and coordinates from Android network location, reverse-geocoded once a day with OpenStreetMap |
 | `look` | Takes a photo with the front or back camera and answers a question about it. Chimes whenever the camera is used, and photos are deleted right away |
 | `read_sensors` | Room light level, tablet orientation, proximity |
@@ -113,6 +116,14 @@ Dean watches this file and starts as soon as a valid key appears.
 3. List LAN lights in `~/assistant/lights.json` (see `lights.example.json`). Give each light a fixed IP in your router so the address doesn't change.
 
 To find LAN lights, send `{"msg":{"cmd":"devStatus","data":{}}}` over UDP to port 4003 on each address and listen on port 4002. Android may filter Govee's multicast scan replies, but these direct replies get through.
+
+## Roku TV
+
+On the TV, go to **Settings → System → Advanced system settings → Control by mobile apps → Network access** and choose **Default**. Dean finds the TV by probing port 8060 on the local network, and remembers it in `~/assistant/roku.json`. Under the "Limited" setting, only status queries work.
+
+## Morning briefing and calendars
+
+Dean creates **good morning** and **good night** routines if you don't have them: weather, today's calendar, reminders and alarms, and three headlines; or tomorrow's first event, the alarm and the overnight low. To connect calendars, add their private iCal links to `~/.dean.env` as `DEAN_CALENDARS=<url>,<url>`. `briefing.py` explains where to find each provider's link. Attach the briefing to an alarm by saying "wake me at 7 on weekdays and run good morning".
 
 ## Wall dashboard
 
