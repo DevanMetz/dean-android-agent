@@ -21,8 +21,10 @@ from pathlib import Path
 import httpx
 from PIL import Image
 
+import alerts
 import briefing
 from govee import Govee, parse_color
+from presence import Presence
 from roku import INPUTS, KEYS, Roku, RokuError
 from scheduler import delete_routine, routines, save_routine
 
@@ -31,6 +33,7 @@ DATA = Path("/data/data/com.termux/files/home/assistant")
 MEMORY_FILE = DATA / "memory.json"
 PLACE_FILE = DATA / "place.json"
 PHOTO = DATA / "snap.jpg"
+LISTS_FILE = DATA / "lists.json"  # {"grocery": ["milk", "eggs"], "to-do": [...]}
 SENSORS_FILE = DATA / "sensors.json"  # {"GVH5075_ABCD": "balcony"}
 SENSOR_APP = "http://127.0.0.1:8765/"  # android/dean-sensors, running on this tablet
 BRIDGE = DATA / "bridge.sock"  # termux/bridge.py, running natively in Termux
@@ -76,23 +79,44 @@ class Toolbox:
         self.chime = chime
         self.lock = threading.Lock()
         self.scheduler = None  # set by dean.py once speech is ready
+        self.presence = Presence()  # dean.py replaces it with one that's being watched
         self.govee = Govee()
         self._roku = None
+        self.active_alerts = None  # refreshed by dean.py's alert watcher
+        self.last_manual_brightness = 0.0  # night mode backs off after a manual change
 
     # ----- location -----
 
+    @staticmethod
+    def _timezone_at(lat, lon):
+        """The location's time zone (the tablet's own setting can be wrong)."""
+        try:
+            return httpx.get("https://api.open-meteo.com/v1/forecast", timeout=10, params={
+                "latitude": lat, "longitude": lon, "timezone": "auto",
+                "current": "temperature_2m"}).json()["timezone"]
+        except Exception:
+            return None
+
     def place(self, refresh=False):
-        """Cached location; refreshed at most once a day."""
-        if not refresh and PLACE_FILE.exists():
-            p = json.loads(PLACE_FILE.read_text())
-            if time.time() - p.get("at", 0) < 86400:
-                return p
-        fix = termux("termux-location", "-p", "network", "-r", "once", timeout=45)
+        """Cached location; refreshed at most once a day. Never raises: if a fresh fix
+        isn't available, the last known place is used."""
+        cached = json.loads(PLACE_FILE.read_text()) if PLACE_FILE.exists() else {}
+        if cached and not cached.get("tz") and "lat" in cached:
+            tz = self._timezone_at(cached["lat"], cached["lon"])
+            if tz:
+                cached["tz"] = tz
+                PLACE_FILE.write_text(json.dumps(cached))
+        if cached and not refresh and time.time() - cached.get("at", 0) < 86400:
+            return cached
+        try:
+            fix = termux("termux-location", "-p", "network", "-r", "once", timeout=45)
+        except Exception:
+            fix = None
         if not isinstance(fix, dict) or "latitude" not in fix:
-            return json.loads(PLACE_FILE.read_text()) if PLACE_FILE.exists() else {}
+            return cached
         lat, lon = fix["latitude"], fix["longitude"]
         p = {"lat": round(lat, 3), "lon": round(lon, 3), "at": time.time()}
-        try:  # reverse-geocode once with OpenStreetMap
+        try:  # reverse-geocode with OpenStreetMap
             a = httpx.get("https://nominatim.openstreetmap.org/reverse",
                           params={"lat": lat, "lon": lon, "format": "jsonv2", "zoom": 14},
                           headers={"User-Agent": "dean-wall-assistant/1.0"}, timeout=15
@@ -101,7 +125,10 @@ class Toolbox:
                      county=a.get("county"), state=a.get("state"),
                      country=a.get("country"), postcode=a.get("postcode"))
         except Exception:
-            pass
+            for k in ("city", "county", "state", "country", "postcode"):
+                if cached.get(k):
+                    p[k] = cached[k]
+        p["tz"] = self._timezone_at(lat, lon) or cached.get("tz")
         PLACE_FILE.write_text(json.dumps(p))
         return p
 
@@ -114,6 +141,16 @@ class Toolbox:
 
     def get_location(self, refresh=False):
         return {k: v for k, v in self.place(refresh).items() if k != "at"}
+
+    def apply_timezone(self):
+        """Use DEAN_TZ, or the time zone of the tablet's location, for every clock in
+        Dean. Returns (tablet_tz, used_tz)."""
+        tablet = os.environ.get("TZ", "")
+        want = os.environ.get("DEAN_TZ") or self.place().get("tz")
+        if want and want != tablet:
+            os.environ["TZ"] = want
+            time.tzset()
+        return tablet, want or tablet
 
     # ----- camera -----
 
@@ -182,6 +219,10 @@ class Toolbox:
         return {"volume_percent": round(level / 15 * 100)}
 
     def set_brightness(self, percent=None, auto=False):
+        self.last_manual_brightness = time.time()
+        return self._set_brightness(percent, auto)
+
+    def _set_brightness(self, percent=None, auto=False):
         if auto:
             termux("termux-brightness", "auto")
             return {"brightness": "auto"}
@@ -260,6 +301,77 @@ class Toolbox:
         """Say something out loud on the tablet at home."""
         threading.Thread(target=self.say, args=(text,), daemon=True).start()
         return {"announced": text}
+
+    # ----- who's home (presence.py) -----
+
+    def who_is_home(self):
+        return self.presence.summary()
+
+    def remind_when_home(self, text, person=None, _ctx=None):
+        people = [p["name"] for p in self.presence.people()]
+        if not people:
+            return {"error": "no household phones set up yet, so I can't tell when someone gets home"}
+        if person is None:
+            if len(people) > 1:
+                return {"error": "whose arrival?", "people": people}
+            person = people[0]
+        match = next((p for p in people if p.lower() == person.lower()), None)
+        if not match:
+            return {"error": f"I don't know {person!r}'s phone", "people": people}
+        ctx = _ctx or {}
+        self.presence.add_arrival_reminder(
+            match, text, notify=ctx.get("chat") if ctx.get("channel") == "telegram" else None)
+        return {"will_remind": match, "about": text, "when": "they get home"}
+
+    # ----- shopping & to-do lists -----
+
+    @staticmethod
+    def _list_name(name):
+        n = (name or "grocery").lower().strip()
+        n = n.removesuffix(" list").strip()
+        return {"shopping": "grocery", "groceries": "grocery", "todo": "to-do",
+                "to do": "to-do", "tasks": "to-do"}.get(n, n)
+
+    def _lists(self):
+        return json.loads(LISTS_FILE.read_text()) if LISTS_FILE.exists() else {}
+
+    def _save_lists(self, lists):
+        LISTS_FILE.write_text(json.dumps(lists, indent=1))
+
+    def list_add(self, items, list_name="grocery"):
+        with self.lock:
+            lists, name = self._lists(), self._list_name(list_name)
+            current = lists.setdefault(name, [])
+            added = [i.strip() for i in items if i.strip()
+                     and i.strip().lower() not in (c.lower() for c in current)]
+            current.extend(added)
+            self._save_lists(lists)
+        return {"list": name, "added": added, "now_has": len(current)}
+
+    def list_remove(self, items, list_name="grocery"):
+        with self.lock:
+            lists, name = self._lists(), self._list_name(list_name)
+            current = lists.get(name, [])
+            want = [i.lower().strip() for i in items]
+            gone = [c for c in current if any(w == c.lower() or w in c.lower() for w in want)]
+            lists[name] = [c for c in current if c not in gone]
+            self._save_lists(lists)
+        return {"list": name, "removed": gone, "left": lists[name]}
+
+    def list_show(self, list_name=None):
+        lists = self._lists()
+        if list_name:
+            name = self._list_name(list_name)
+            return {"list": name, "items": lists.get(name, [])}
+        return {name: items for name, items in lists.items() if items} or {"note": "all lists are empty"}
+
+    def list_clear(self, list_name="grocery"):
+        with self.lock:
+            lists, name = self._lists(), self._list_name(list_name)
+            count = len(lists.get(name, []))
+            lists[name] = []
+            self._save_lists(lists)
+        return {"list": name, "cleared": count}
 
     # ----- memory -----
 
@@ -343,6 +455,19 @@ class Toolbox:
             s.send_message(msg)
         return {"phone": "iPhone", "ringing": True,
                 "note": "the iPhone gets the email in a few seconds, then its shortcut plays sound"}
+
+    # ----- weather alerts (alerts.py) -----
+
+    def weather_alerts(self):
+        if self.active_alerts is None:
+            p = self.place()
+            if not p:
+                return {"error": "location unknown"}
+            self.active_alerts = alerts.active(p["lat"], p["lon"])
+        if not self.active_alerts:
+            return {"note": "no active weather alerts"}
+        return [{k: a[k] for k in ("event", "level", "headline", "ends", "instruction")}
+                for a in self.active_alerts]
 
     # ----- calendar & news (briefing.py) -----
 
@@ -535,6 +660,8 @@ TOOLS = [
           {"phone": {"type": "string", "enum": ["pixel", "iphone"]},
            "stop": {"type": "boolean", "description": "Stop ringing instead."}},
           ["phone"]),
+    _tool("weather_alerts", "Active National Weather Service warnings, watches and advisories "
+          "for home."),
     _tool("calendar_events", "Events from the household's calendars for a day (or several).",
           {"day": {"type": "string",
                    "description": "'today', 'tomorrow', a weekday name, or YYYY-MM-DD."},
@@ -614,6 +741,23 @@ TOOLS = [
     _tool("remove_routine", "Delete a saved routine.", {"name": {"type": "string"}}, ["name"]),
     _tool("announce", "Say something out loud on the tablet at home (for when the person is "
           "texting from elsewhere).", {"text": {"type": "string"}}, ["text"]),
+    _tool("who_is_home", "Which household members are home right now (by their phones on the "
+          "home Wi-Fi), and for how long."),
+    _tool("remind_when_home", "Remind someone about something as soon as they get home.",
+          {"text": {"type": "string"},
+           "person": {"type": "string", "description": "Whose arrival; optional if only one person."}},
+          ["text"]),
+    _tool("list_add", "Add items to a list (grocery by default; also to-do or any named list).",
+          {"items": {"type": "array", "items": {"type": "string"}},
+           "list_name": {"type": "string", "description": "e.g. grocery, to-do, Costco."}},
+          ["items"]),
+    _tool("list_remove", "Check items off / remove them from a list.",
+          {"items": {"type": "array", "items": {"type": "string"}},
+           "list_name": {"type": "string"}}, ["items"]),
+    _tool("list_show", "Read a list, or every non-empty list if no name is given.",
+          {"list_name": {"type": "string"}}),
+    _tool("list_clear", "Empty a list (e.g. after shopping).",
+          {"list_name": {"type": "string"}}),
     _tool("remember", "Save a lasting fact about the household or the person's preferences "
           "(names, birthdays, likes, routines). Use when asked to remember something.",
           {"fact": {"type": "string"}}, ["fact"]),

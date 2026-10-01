@@ -2,6 +2,7 @@
 *.pyc
 .dean.env
 __pycache__/
+alerts_seen.json
 android/dean-finder/*.apk
 android/dean-finder/*.idsig
 android/dean-finder/*.keystore
@@ -11,8 +12,11 @@ android/dean-sensors/*.apk
 android/dean-sensors/*.idsig
 android/dean-sensors/*.keystore
 android/dean-sensors/build/
+arrival_reminders.json
 lights.json
+lists.json
 memory.json
+people.json
 place.json
 roku.json
 routines.json

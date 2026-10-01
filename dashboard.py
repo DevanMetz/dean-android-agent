@@ -131,6 +131,9 @@ class Dashboard:
         out.append(center(f"{C['dim']}{now.strftime('%A, %B')} {now.day}{C['off']}", w))
         out.append("")
 
+        for a in (self.tb.active_alerts or [])[:2]:
+            color = "red" if a["level"] == "warning" else "yellow"
+            out.append(f"  {C[color]}{C['bold']}⚠ {a['event']}{C['off']}")
         wx = self.weather
         if wx and "now" in wx:
             n, d = wx["now"], (wx.get("days") or [{}])[0]
@@ -161,6 +164,21 @@ class Dashboard:
         for item in nxt:
             icon = {"alarm": "⏰", "timer": "⏲", "routine": "↻"}.get(item["kind"], "•")
             out.append(f"  {C['blue']}{icon}{C['off']} {item['what']}  {C['dim']}{item['when']}{C['off']}")
+        try:
+            people = self.tb.presence.summary()
+            if isinstance(people, list) and people:
+                bits = [f"{C['green']}●{C['off']} {p['name']}" if p["home"]
+                        else f"{C['dim']}○ {p['name']}{C['off']}" for p in people]
+                out.append("  ⌂ " + "   ".join(bits))
+        except Exception:
+            pass
+        try:
+            lists = self.tb.list_show()
+            counts = [f"{n}: {len(i)}" for n, i in lists.items() if isinstance(i, list) and i]
+            if counts:
+                out.append(f"  {C['blue']}☰{C['off']} {C['dim']}{'  ·  '.join(counts)}{C['off']}")
+        except Exception:
+            pass
         out.append(C["dim"] + "─" * w + C["off"])
 
         # conversation fills the rest, newest at the bottom

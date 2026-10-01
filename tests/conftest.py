@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 @pytest.fixture(autouse=True)
 def tablet_home(tmp_path, monkeypatch):
     import govee
+    import presence
     import roku
     import scheduler
     import tools
@@ -24,4 +25,7 @@ def tablet_home(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "MEMORY_FILE", tmp_path / "memory.json")
     monkeypatch.setattr(tools, "PLACE_FILE", tmp_path / "place.json")
     monkeypatch.setattr(tools, "SENSORS_FILE", tmp_path / "sensors.json")
+    monkeypatch.setattr(tools, "LISTS_FILE", tmp_path / "lists.json")
+    monkeypatch.setattr(presence, "PEOPLE_FILE", tmp_path / "people.json")
+    monkeypatch.setattr(presence, "PENDING_FILE", tmp_path / "arrival_reminders.json")
     return tmp_path

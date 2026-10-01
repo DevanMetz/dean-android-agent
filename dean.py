@@ -42,6 +42,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tools import TOOLS, Toolbox  # noqa: E402
 from scheduler import Scheduler, routines, save_routine  # noqa: E402
 from briefing import GOOD_MORNING, GOOD_NIGHT  # noqa: E402
+import alerts  # noqa: E402
+from presence import Presence  # noqa: E402
 from telegram_bot import TelegramBot  # noqa: E402
 from dashboard import Dashboard  # noqa: E402
 
@@ -718,6 +720,53 @@ class Home:
                 play(CHIME_WAKE)
             self.voice.speak(msg)
 
+    def notify_everyone(self, text):
+        if self.bot:
+            for chat in self.bot.allowed:
+                try:
+                    self.bot.send(chat, text)
+                except Exception as e:
+                    show("warn", f"Telegram: {e}")
+
+    def weather_alert(self, a):
+        until = ""
+        if a.get("ends"):
+            try:
+                until = " until " + datetime.fromisoformat(a["ends"]).astimezone().strftime(
+                    "%I:%M %p").lstrip("0")
+            except ValueError:
+                pass
+        msg = f"Weather alert: {a['event']}{until}."
+        show("warn", msg)
+        if a["level"] in ("warning", "watch"):
+            self.notify_everyone(msg + (f"\n{a['instruction']}" if a.get("instruction") else ""))
+        if a["level"] == "warning":
+            for _ in range(3):
+                play(CHIME_ALARM)
+            first_step = a.get("instruction", "").split(". ")[0].strip().rstrip(".")
+            self.voice.speak(msg + (f" {first_step}." if first_step else ""))
+
+    def arrived(self, name):
+        show("status", f"{name} got home")
+        reminders = self.tb.presence.take_arrival_reminders(name)
+        has_routine = "welcome home" in routines()
+        if not reminders and not has_routine:
+            return
+        time.sleep(60)  # give them a minute to get inside
+        for r in reminders:
+            msg = f"Welcome home, {name}. Reminder: {r['text'].rstrip('.')}."
+            show("status", msg)
+            self.notify(r, msg)
+            for _ in range(2):
+                play(CHIME_WAKE)
+            self.voice.speak(msg)
+        if has_routine:
+            with self.bg_lock:
+                reply = self.bg.ask(f"{name} just got home. Run my 'welcome home' routine now.")
+            if reply:
+                show("dean", reply)
+                self.voice.speak(reply)
+
     def notify(self, item, text):
         if self.bot and item.get("notify"):
             try:
@@ -766,6 +815,100 @@ class Home:
             self.voice.speak(reply)
 
 
+ALERTS_SEEN = Path("/data/data/com.termux/files/home/assistant/alerts_seen.json")
+
+
+def alert_loop(home, toolbox):
+    """Every 5 minutes, look for new National Weather Service alerts for home."""
+    seen = set(json.loads(ALERTS_SEEN.read_text())) if ALERTS_SEEN.exists() else set()
+    failing = False
+    while True:
+        p = toolbox.place()
+        if p and p.get("country") in (None, "United States"):
+            try:
+                current = alerts.active(p["lat"], p["lon"])
+                toolbox.active_alerts = current
+                for a in current:
+                    if a["id"] not in seen:
+                        seen.add(a["id"])
+                        home.weather_alert(a)
+                seen = {a["id"] for a in current}  # forget alerts once they've expired
+                ALERTS_SEEN.write_text(json.dumps(sorted(seen)))
+                failing = False
+            except Exception as e:
+                if not failing:
+                    show("warn", f"weather alerts unavailable: {e}")
+                failing = True
+        time.sleep(300)
+
+
+class NightMode(threading.Thread):
+    """Dim the screen when the room is dark during night hours; brighten it when the
+    lights come on, the night ends, or someone says "hey Dean"."""
+
+    def __init__(self, toolbox):
+        super().__init__(daemon=True, name="night-mode")
+        self.tb = toolbox
+        start, end = os.environ.get("DEAN_NIGHT_HOURS", "20-9").split("-")
+        self.hours = (int(start), int(end))
+        self.night = float(os.environ.get("DEAN_NIGHT_BRIGHTNESS", "2"))
+        self.day = float(os.environ.get("DEAN_DAY_BRIGHTNESS", "70"))
+        self.dimmed = False
+        self.awake_until = 0.0  # screen temporarily bright for an interaction
+        self.dark_reads = 0
+        self.warned = False
+
+    def is_night(self):
+        h = datetime.now().hour
+        start, end = self.hours
+        return h >= start or h < end if start > end else start <= h < end
+
+    def set(self, percent):
+        try:
+            self.tb._set_brightness(percent)
+            return True
+        except Exception as e:
+            if not self.warned:
+                show("warn", f"night mode can't change brightness ({e}); re-allow 'Modify "
+                             "system settings' for Termux:API")
+                self.warned = True
+            return False
+
+    def wake(self):
+        """Called when someone says "hey Dean": light the screen up for a minute."""
+        if self.dimmed and self.set(40):
+            self.awake_until = time.time() + 60
+
+    def run(self):
+        while True:
+            time.sleep(30)
+            if os.environ.get("DEAN_NIGHT_MODE", "1") != "1":
+                continue
+            if time.time() - self.tb.last_manual_brightness < 1800:
+                continue  # someone set the brightness themselves; leave it for 30 minutes
+            if self.awake_until:
+                if time.time() < self.awake_until:
+                    continue
+                self.awake_until = 0.0
+                self.set(self.night)  # back to dim after an interaction
+            try:
+                lux = self.tb.read_sensors().get("light_lux")
+            except Exception:
+                continue
+            if lux is None:
+                continue
+            if not self.dimmed:
+                self.dark_reads = self.dark_reads + 1 if (self.is_night() and lux <= 2) else 0
+                if self.dark_reads >= 3 and self.set(self.night):  # dark for ~90 s
+                    self.dimmed = True
+                    show("status", "night mode: screen dimmed")
+            elif lux >= 8 or not self.is_night():
+                if self.set(self.day):
+                    self.dimmed = False
+                    self.dark_reads = 0
+                    show("status", "night mode: screen back to normal")
+
+
 def health_loop(toolbox):
     """Every 10 minutes: follow lights that changed IP address, and restart the Dean
     Sensors app if it stopped answering. Only problems and fixes are shown."""
@@ -795,6 +938,7 @@ def text_mode(questions):
         print("No OPENROUTER_API_KEY in ~/.dean.env")
         return 2
     brain = Brain()
+    brain.tools.apply_timezone()
     brain.tools.scheduler = Scheduler(run=False)  # the live Dean process does the firing
     for q in questions:
         show("you", q)
@@ -828,9 +972,17 @@ def main():
     mic.start()
     ear = Listener(mic, transcribe)
     toolbox = make_toolbox(openrouter_client(), say=voice.speak)
+    tablet_tz, used_tz = toolbox.apply_timezone()
     brain = Brain(toolbox=toolbox, channel="voice")
     home = Home(voice, toolbox)
     threading.Thread(target=health_loop, args=(toolbox,), daemon=True, name="health").start()
+    threading.Thread(target=alert_loop, args=(home, toolbox), daemon=True, name="alerts").start()
+    night = NightMode(toolbox)
+    night.start()
+    toolbox.presence = Presence(
+        on_arrive=lambda n: threading.Thread(target=home.arrived, args=(n,), daemon=True).start(),
+        on_leave=lambda n: show("status", f"{n} left"))
+    threading.Thread(target=toolbox.presence.run_forever, daemon=True, name="presence").start()
     for name, steps in (("good morning", GOOD_MORNING), ("good night", GOOD_NIGHT)):
         if name not in routines():  # built-in defaults; edit or replace them by voice
             save_routine(name, steps)
@@ -848,12 +1000,16 @@ def main():
                    + ("  ·  Telegram on" if token else ""))
     where = toolbox.place_line()
     show("status", where or "location unknown")
+    if tablet_tz and used_tz != tablet_tz:
+        show("warn", f"the tablet's time zone is {tablet_tz}, but it's in {used_tz}; Dean uses "
+                     f"{used_tz}. Fix it in Android: Settings > System > Date & time.")
 
     follow_up = False
     while True:
         state('Say "hey Dean"')
         if not follow_up:
             ear.wait_for_wake()
+            night.wake()
             if home.stop_alarm():
                 show("status", "alarm off")
                 play(CHIME_DONE)

@@ -24,6 +24,9 @@ The model gets these tools and decides when to use them:
 | `calendar_events` | Events from private iCal feeds (Google, iCloud, Outlook) set in `DEAN_CALENDARS` |
 | `news_headlines` | Top stories (NPR) or headlines on a topic (Google News RSS) |
 | `ai_spending` | OpenRouter spend today, this week, this month and all time, plus what's left before the key's limit |
+| `list_add`, `list_remove`, `list_show`, `list_clear` | Grocery, to-do and any named lists, shared between voice and text |
+| `weather_alerts` | Active National Weather Service alerts for home |
+| `who_is_home`, `remind_when_home` | Presence from household phones on the Wi-Fi, plus reminders that wait until someone gets home |
 | `get_location` | City and coordinates from Android network location, reverse-geocoded once a day with OpenStreetMap |
 | `look` | Takes a photo with the front or back camera and answers a question about it. Chimes whenever the camera is used, and photos are deleted right away |
 | `read_sensors` | Room light level, tablet orientation, proximity |
@@ -93,6 +96,8 @@ proot-distro login debian -- bash -c '
 
 Copy the files into place (the table above lists where each goes) and make `run.sh` and `01-services` executable. `deploy.sh` does this for you once SSH works.
 
+Audio uses a private Unix socket. Inside Debian, add `/etc/pulse/client.conf.d/50-dean-no-shm.conf` containing `enable-shm = no` and `enable-memfd = no`; shared memory doesn't work through proot.
+
 Optional: to manage the tablet over SSH, add your public key to `~/.ssh/authorized_keys` and run `sshd`. It listens on port 8022.
 
 ### 4. API key
@@ -157,6 +162,16 @@ Termux can't use Bluetooth, so a small companion app on the tablet does it: `and
 **iPhone: Shortcuts automation** (an iPhone can't run third-party background listeners without the App Store)
 - Dean emails the iPhone. A Shortcuts automation that runs when an email with that subject arrives turns the volume up and speaks or vibrates.
 - Set `DEAN_SMTP_HOST`, `DEAN_SMTP_USER`, `DEAN_SMTP_PASSWORD` (an app password), `DEAN_IPHONE_EMAIL` and, optionally, `DEAN_IPHONE_SUBJECT` in `~/.dean.env`. Use an address that Apple Mail on the iPhone gets by **push**, such as iCloud Mail, so the email arrives within seconds.
+
+## Weather alerts, night mode, time zone
+
+- **Alerts:** every 5 minutes Dean checks [api.weather.gov](https://www.weather.gov/documentation/services-web-api) for the tablet's location. Warnings chime and are announced at home, with the first safety instruction, and are texted to every allowed Telegram chat. Watches are texted and shown on the dashboard. Advisories only show on the dashboard. This works for US locations only.
+- **Night mode:** between `DEAN_NIGHT_HOURS` (default `20-9`), if the room stays dark (≤ 2 lux for about 90 s), the screen dims to `DEAN_NIGHT_BRIGHTNESS`% (default 2). It returns to `DEAN_DAY_BRIGHTNESS`% (default 70) when the lights come on or the night ends. Saying "hey Dean" lights the screen up for a minute. If someone sets the brightness by hand, night mode pauses for 30 minutes. Turn it off with `DEAN_NIGHT_MODE=0`.
+- **Time zone:** Dean uses the time zone of the tablet's location, or `DEAN_TZ`, even if Android's setting is wrong, and shows a note on the dashboard when the two disagree.
+
+## Who's home
+
+List household phones in `~/assistant/people.json` (see `presence.py`), and give them fixed IPs in the router. Every minute Dean probes them over TCP: an iPhone answers on port 62078, and other phones answer with a refusal, which still proves they're there. Someone counts as arrived immediately and as away after 15 minutes without a response, because sleeping phones miss probes. On arrival Dean delivers any "remind me when I get home" items and runs a **welcome home** routine if you've created one.
 
 ## Self-healing
 
