@@ -352,6 +352,24 @@ class Toolbox:
     def news_headlines(self, topic=None, count=5):
         return briefing.headlines(topic, max(1, min(int(count), 10)))
 
+    # ----- OpenRouter spending -----
+
+    def ai_spending(self):
+        r = self.http.get("https://openrouter.ai/api/v1/key", timeout=10)
+        r.raise_for_status()
+        d = r.json().get("data", {})
+        money = lambda v: None if v is None else f"${v:,.2f}"  # noqa: E731
+        out = {"today": money(d.get("usage_daily")), "this_week": money(d.get("usage_weekly")),
+               "this_month": money(d.get("usage_monthly")), "all_time": money(d.get("usage")),
+               "spending_limit": money(d.get("limit")),
+               "left_before_limit": money(d.get("limit_remaining"))}
+        return {k: v for k, v in out.items() if v is not None}
+
+    def restart_sensor_app(self):
+        """Used by the health check when the Dean Sensors app stops answering."""
+        return _run(["am", "broadcast", "-n", "com.dean.sensors/.BootReceiver",
+                     "-a", "com.dean.sensors.START"], 20, None)
+
     # ----- Roku TV -----
 
     def tv(self, action, app=None, text=None, times=1):
@@ -525,6 +543,8 @@ TOOLS = [
           "web_search for 'what's in the news'.",
           {"topic": {"type": "string", "description": "Optional, e.g. 'Milwaukee Bucks'."},
            "count": {"type": "integer", "minimum": 1, "maximum": 10}}),
+    _tool("ai_spending", "How much Dean's AI usage has cost (today, this week, this month, all "
+          "time) and how much is left before the spending limit."),
     _tool("tv", "Control the Roku TV: power, volume, open apps (Netflix, YouTube...), play/pause, "
           "navigate, search for a show, switch inputs, or check what's on.",
           {"action": {"type": "string", "enum": [

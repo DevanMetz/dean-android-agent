@@ -15,6 +15,9 @@ import subprocess
 
 SOCKET = os.path.expanduser("~/assistant/bridge.sock")
 PREFIX = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
+# the one Activity Manager command Dean may run: restart the Dean Sensors app's scanner
+RESTART_SENSORS = ["am", "broadcast", "-n", "com.dean.sensors/.BootReceiver",
+                   "-a", "com.dean.sensors.START"]
 ALLOWED = {
     "termux-battery-status", "termux-brightness", "termux-camera-photo", "termux-location",
     "termux-sensor", "termux-torch", "termux-tts-speak", "termux-volume",
@@ -27,7 +30,7 @@ class Handler(socketserver.StreamRequestHandler):
         try:
             req = json.loads(self.rfile.readline())
             args = [str(a) for a in req["args"]]
-            if args[0] not in ALLOWED:
+            if args[0] not in ALLOWED and args != RESTART_SENSORS:
                 raise ValueError(f"command not allowed: {args[0]}")
             r = subprocess.run([f"{PREFIX}/bin/{args[0]}", *args[1:]], capture_output=True,
                                text=True, input=req.get("stdin"),

@@ -1,0 +1,6 @@
+# What the tests need on a normal computer (the tablet also has vosk, sherpa-onnx, piper-tts).
+httpx
+pillow
+icalendar
+recurring-ical-events
+pytest

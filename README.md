@@ -23,6 +23,7 @@ The model gets these tools and decides when to use them:
 | `tv` | Roku TV over the local network: power, volume, apps, playback, navigation, search, inputs, status |
 | `calendar_events` | Events from private iCal feeds (Google, iCloud, Outlook) set in `DEAN_CALENDARS` |
 | `news_headlines` | Top stories (NPR) or headlines on a topic (Google News RSS) |
+| `ai_spending` | OpenRouter spend today, this week, this month and all time, plus what's left before the key's limit |
 | `get_location` | City and coordinates from Android network location, reverse-geocoded once a day with OpenStreetMap |
 | `look` | Takes a photo with the front or back camera and answers a question about it. Chimes whenever the camera is used, and photos are deleted right away |
 | `read_sensors` | Room light level, tablet orientation, proximity |
@@ -157,6 +158,14 @@ Termux can't use Bluetooth, so a small companion app on the tablet does it: `and
 - Dean emails the iPhone. A Shortcuts automation that runs when an email with that subject arrives turns the volume up and speaks or vibrates.
 - Set `DEAN_SMTP_HOST`, `DEAN_SMTP_USER`, `DEAN_SMTP_PASSWORD` (an app password), `DEAN_IPHONE_EMAIL` and, optionally, `DEAN_IPHONE_SUBJECT` in `~/.dean.env`. Use an address that Apple Mail on the iPhone gets by **push**, such as iCloud Mail, so the email arrives within seconds.
 
+## Self-healing
+
+- **Lights:** every 10 minutes Dean asks each LAN light who it is, remembering hardware IDs in `lights.json`. If a light stops answering at its address, Dean sweeps the subnet (at most every 30 minutes) and follows it to its new IP.
+- **Roku:** if the TV stops answering, Dean finds it again by probing port 8060.
+- **Bridge:** `run.sh` runs `bridge.py` under a supervisor loop that restarts it, and Dean falls back to slower direct calls in the meantime.
+- **Dean Sensors:** if its local endpoint stops answering, Dean restarts it through the bridge, which is allowed to run only that one Activity Manager command.
+- **Model:** a removed or unavailable model falls back to `DEAN_FALLBACK_MODEL`.
+
 ## Development
 
 With SSH set up, push changes from your PC and restart Dean:
@@ -170,6 +179,15 @@ Test the LLM and tool loop without speaking. Repeated `--ask` flags continue the
 ```bash
 ./deploy.sh <tablet-ip> --ask "What's the weather tomorrow?" --ask "And the day after?"
 ```
+
+Run the tests on any computer; they don't need the tablet:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+GitHub Actions runs the same tests and `pyflakes` on every push.
 
 ## Latency
 

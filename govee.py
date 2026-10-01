@@ -130,6 +130,59 @@ class Govee:
                     return json.loads(data)["msg"]["data"]
         return None
 
+    @staticmethod
+    def lan_scan(ips, timeout=2.0):
+        """Ask each address who it is: {ip: {"device": id, "sku": model}}. Unicast to 4001
+        works here, while Android tends to drop replies to the multicast scan."""
+        found = {}
+        with Govee._status_lock, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as rx:
+            rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            rx.bind(("", 4002))
+            rx.settimeout(0.3)
+            msg = json.dumps({"msg": {"cmd": "scan", "data": {"account_topic": "reserve"}}}).encode()
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tx:
+                for ip in ips:
+                    tx.sendto(msg, (ip, 4001))
+            end = time.time() + timeout
+            while time.time() < end:
+                try:
+                    data, addr = rx.recvfrom(4096)
+                    d = json.loads(data)["msg"]["data"]
+                    if d.get("device"):
+                        found[addr[0]] = {"device": d["device"], "sku": d.get("sku")}
+                except socket.timeout:
+                    pass
+                except (ValueError, KeyError):
+                    pass
+        return found
+
+    def heal(self):
+        """Learn hardware ids, and follow lights whose IP address changed. Returns a list
+        of what changed (empty when all is well)."""
+        lan = [l for l in self.lights if l.get("lan_ip")]
+        if not lan:
+            return []
+        changes = []
+        seen = self.lan_scan([l["lan_ip"] for l in lan])
+        for l in lan:
+            hit = seen.get(l["lan_ip"])
+            if hit and not l.get("device"):
+                l["device"], l["sku"] = hit["device"], hit.get("sku") or l.get("sku")
+                changes.append(f"learned the id of {l['name']}")
+        missing = [l for l in lan if l.get("device") and l["lan_ip"] not in seen]
+        if missing and time.time() - getattr(self, "_last_sweep", 0) > 1800:
+            self._last_sweep = time.time()
+            subnet = lan[0]["lan_ip"].rsplit(".", 1)[0]
+            everyone = self.lan_scan([f"{subnet}.{i}" for i in range(1, 255)], timeout=3.0)
+            where = {v["device"]: ip for ip, v in everyone.items()}
+            for l in missing:
+                if l["device"] in where and where[l["device"]] != l["lan_ip"]:
+                    changes.append(f"{l['name']} moved from {l['lan_ip']} to {where[l['device']]}")
+                    l["lan_ip"] = where[l["device"]]
+        if changes:
+            LIGHTS_FILE.write_text(json.dumps(self.lights, indent=1))
+        return changes
+
     # ----- cloud -----
 
     def cloud_control(self, light, cap_type, instance, value):

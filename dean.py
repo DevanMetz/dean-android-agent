@@ -766,6 +766,27 @@ class Home:
             self.voice.speak(reply)
 
 
+def health_loop(toolbox):
+    """Every 10 minutes: follow lights that changed IP address, and restart the Dean
+    Sensors app if it stopped answering. Only problems and fixes are shown."""
+    time.sleep(60)
+    while True:
+        try:
+            for change in toolbox.govee.heal():
+                show("status", f"lights: {change}")
+        except Exception as e:
+            show("warn", f"lights check failed: {e}")
+        try:
+            httpx.get("http://127.0.0.1:8765/", timeout=3)
+        except httpx.HTTPError:
+            show("warn", "Dean Sensors app not answering; restarting it")
+            try:
+                toolbox.restart_sensor_app()
+            except Exception as e:
+                show("warn", f"couldn't restart Dean Sensors: {e}")
+        time.sleep(600)
+
+
 # ---------- main loop ----------
 
 def text_mode(questions):
@@ -809,6 +830,7 @@ def main():
     toolbox = make_toolbox(openrouter_client(), say=voice.speak)
     brain = Brain(toolbox=toolbox, channel="voice")
     home = Home(voice, toolbox)
+    threading.Thread(target=health_loop, args=(toolbox,), daemon=True, name="health").start()
     for name, steps in (("good morning", GOOD_MORNING), ("good night", GOOD_NIGHT)):
         if name not in routines():  # built-in defaults; edit or replace them by voice
             save_routine(name, steps)
