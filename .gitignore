@@ -10,3 +10,4 @@ android/dean-finder/topic.secret
 android/dean-finder/build/
 android/dean-finder/*.apk
 android/dean-finder/*.keystore
+android/dean-finder/*.idsig
