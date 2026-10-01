@@ -1,0 +1,7 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Runs at boot via Termux:Boot. Brings Termux to the screen; its shell
+# (.bashrc) then starts Dean in the foreground so Android allows the mic.
+termux-wake-lock
+sshd
+sleep 5
+am start -n com.termux/.app.TermuxActivity >/dev/null 2>&1

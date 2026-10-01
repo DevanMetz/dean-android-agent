@@ -1,0 +1,7 @@
+.dean.env
+*.env
+memory.json
+place.json
+snap.jpg
+__pycache__/
+*.pyc
