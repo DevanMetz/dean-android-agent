@@ -313,7 +313,7 @@ class Transcriber:
 # ---------- brain ----------
 
 TOOL_STATUS = {"web_search": "searching the web…", "look": "taking a photo…",
-               "get_weather": "checking the weather…",
+               "get_weather": "checking the weather…", "lights": "lights…",
                "get_location": "checking location…", "read_sensors": "reading sensors…"}
 
 
@@ -340,6 +340,9 @@ class Brain:
 
     def system(self):
         parts = [SYSTEM, LOCATION and f"The household is in {LOCATION}." or self.tools.place_line()]
+        names = self.tools.govee.names()
+        if names:
+            parts.append("Smart lights you can control: " + ", ".join(names) + ".")
         mem = self.tools.memories()
         if mem:
             parts.append("Things you've been asked to remember: " + " | ".join(mem))

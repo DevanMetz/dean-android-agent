@@ -1,0 +1,4 @@
+[
+ {"name": "bedroom ceiling light", "aliases": ["my room", "bedroom", "ceiling"], "sku": "H60A1", "lan_ip": "192.168.1.204"},
+ {"name": "living room bulb", "aliases": ["living room"], "sku": "H1401", "device": "filled in automatically from the Govee cloud"}
+]

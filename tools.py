@@ -17,6 +17,8 @@ from pathlib import Path
 import httpx
 from PIL import Image
 
+from govee import Govee, parse_color
+
 TERMUX_BIN = "/data/data/com.termux/files/usr/bin"
 DATA = Path("/data/data/com.termux/files/home/assistant")
 MEMORY_FILE = DATA / "memory.json"
@@ -65,6 +67,7 @@ class Toolbox:
         self.chime = chime
         self.timers = {}
         self.lock = threading.Lock()
+        self.govee = Govee()
 
     # ----- location -----
 
@@ -229,6 +232,32 @@ class Toolbox:
         MEMORY_FILE.write_text(json.dumps(keep, indent=1))
         return {"forgot": len(m) - len(keep)}
 
+    # ----- lights -----
+
+    def lights(self, target="all", power=None, brightness=None, color=None, kelvin=None):
+        hits = self.govee.find(target)
+        if not hits:
+            return {"error": f"no light matches {target!r}", "lights": self.govee.names()}
+        rgb = parse_color(color) if color else None
+        if brightness is not None and brightness <= 0:
+            power, brightness = "off", None
+        change = power is not None or brightness is not None or rgb or kelvin
+        on = None if power is None else power == "on"
+        if change and on is None and (brightness or rgb or kelvin):
+            on = True  # "make it blue" implies turning it on
+
+        def one(light):
+            try:
+                if not change:
+                    return {"light": light["name"], **self.govee.status(light)}
+                self.govee.apply(light, on=on, brightness=brightness, color=rgb, kelvin=kelvin)
+                return {"light": light["name"], "done": True}
+            except Exception as e:
+                return {"light": light["name"], "error": f"{type(e).__name__}: {e}"}
+
+        with ThreadPoolExecutor(len(hits)) as pool:
+            return list(pool.map(one, hits))
+
     # ----- weather -----
 
     WMO = {0: "clear", 1: "mostly clear", 2: "partly cloudy", 3: "overcast", 45: "fog",
@@ -314,6 +343,19 @@ TOOLS = [
     _tool("web_search", "Search the web for current information: news, sports, business hours, "
           "prices, events, weather elsewhere, anything that may have changed recently.",
           {"query": {"type": "string"}}, ["query"]),
+    _tool("lights", "Control or check the Govee smart lights. Leave power, brightness, color "
+          "and kelvin all out to just get their current state.",
+          {"target": {"type": "string", "description": "A light or room name, or 'all'."},
+           "power": {"type": "string", "enum": ["on", "off"]},
+           "brightness": {"type": "number", "minimum": 0, "maximum": 100,
+                          "description": "Percent."},
+           "color": {"type": "string",
+                     "description": "Color name (red, orange, yellow, green, teal, blue, purple, "
+                                    "pink, white...) or hex like #ff8800."},
+           "kelvin": {"type": "number", "minimum": 2000, "maximum": 9000,
+                      "description": "White color temperature: ~2700 warm, ~4000 neutral, "
+                                     "~6500 daylight."}},
+          ["target"]),
     _tool("get_location", "Get the tablet's current location (city, state, coordinates).",
           {"refresh": {"type": "boolean", "description": "Force a fresh location fix."}}),
     _tool("look", "Take a photo with the tablet camera and answer a question about it. Only use "

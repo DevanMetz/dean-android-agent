@@ -17,6 +17,7 @@ The model gets these tools and decides when to use them:
 |---|---|
 | `web_search` | Current info such as weather, news, scores and hours (OpenRouter web plugin) |
 | `get_weather` | Current conditions and 1–7 day forecast from [Open-Meteo](https://open-meteo.com), free with no key, ~0.3 s |
+| `lights` | Govee lights: on/off, brightness, color, warm/cool white, or current state. Uses the LAN API where enabled (~50 ms) and the Govee cloud API otherwise |
 | `get_location` | City and coordinates from Android network location, reverse-geocoded once a day with OpenStreetMap |
 | `look` | Takes a photo with the front or back camera and answers a question about it. Chimes whenever the camera is used, and photos are deleted right away |
 | `read_sensors` | Room light level, tablet orientation, proximity |
@@ -33,6 +34,7 @@ Conversations carry over for 3 minutes, so follow-ups like "what about tomorrow?
 |---|---|
 | `dean.py` | `~/assistant/dean.py`: main loop (audio, wake word, STT, LLM tool loop, TTS) |
 | `tools.py` | `~/assistant/tools.py`: tool implementations (Termux:API) |
+| `govee.py` | `~/assistant/govee.py`: Govee light control (LAN and cloud) |
 | `termux/bridge.py` | `~/assistant/bridge.py`: runs Termux:API commands natively for Dean (~0.35 s vs ~2.5 s through proot) |
 | `run.sh` | `~/assistant/run.sh`: supervisor that restarts audio and Dean |
 | `termux/boot-01-services` | `~/.termux/boot/01-services`: runs at boot through Termux:Boot |
@@ -96,6 +98,14 @@ OPENROUTER_API_KEY=sk-or-...
 ```
 
 Dean watches this file and starts as soon as a valid key appears.
+
+## Govee lights
+
+1. In the Govee Home app, turn on **LAN Control** for each light that offers it (light → gear icon). This is fast and local.
+2. For lights without LAN control, get an API key (Profile → gear → **Apply for API Key**) and add `GOVEE_API_KEY=...` to `~/.dean.env`. Cloud lights are discovered automatically, using the names from the app.
+3. List LAN lights in `~/assistant/lights.json` (see `lights.example.json`). Give each light a fixed IP in your router so the address doesn't change.
+
+To find LAN lights, send `{"msg":{"cmd":"devStatus","data":{}}}` over UDP to port 4003 on each address and listen on port 4002. Android may filter Govee's multicast scan replies, but these direct replies get through.
 
 ## Development
 
