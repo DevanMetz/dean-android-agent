@@ -90,6 +90,20 @@ OPENROUTER_API_KEY=sk-or-...
 
 Dean watches this file and starts as soon as a valid key appears.
 
+## Development
+
+With SSH set up, push changes from your PC and restart Dean:
+
+```bash
+./deploy.sh <tablet-ip>
+```
+
+Test the LLM and tool loop without speaking. Repeated `--ask` flags continue the same conversation:
+
+```bash
+./deploy.sh <tablet-ip> --ask "What's the weather tomorrow?" --ask "And the day after?"
+```
+
 ## Gotchas
 - **Termux must be the app on screen.** Android silences the mic for background apps. Dean detects a muted mic and restarts its audio, which recovers once Termux is back in front. That's why it runs as the full-screen app on the wall.
 - **Lock screen:** Termux:Boot only runs after the first unlock following a reboot. Use no lock or swipe-to-unlock if you want it to recover from power cuts unattended.
