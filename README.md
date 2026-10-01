@@ -3,8 +3,8 @@
 Dean turns a cheap Android tablet into an always-on voice assistant for your living room. It runs on an unrooted tablet. Wake-word detection and speech-to-text run on the tablet; only the transcribed text goes to the LLM, through [OpenRouter](https://openrouter.ai).
 
 ```
-mic → "hey dean" (Vosk, on-device) → speech-to-text (faster-whisper, on-device)
-    → LLM with tools (OpenRouter) → Android text-to-speech
+mic → "hey dean" (Vosk) → speech-to-text (Moonshine) → LLM with tools (OpenRouter, streamed)
+    → text-to-speech (Piper), spoken sentence by sentence as the answer streams in
 ```
 
 Built and tested on an **onn. 12" Tablet Pro (2024, model 100146663)**, a MediaTek Helio G99 with 6 GB RAM running Android 14. It should work on most arm64 Android tablets.
@@ -16,6 +16,7 @@ The model gets these tools and decides when to use them:
 | Tool | What it does |
 |---|---|
 | `web_search` | Current info such as weather, news, scores and hours (OpenRouter web plugin) |
+| `get_weather` | Current conditions and 1–7 day forecast from [Open-Meteo](https://open-meteo.com), free with no key, ~0.3 s |
 | `get_location` | City and coordinates from Android network location, reverse-geocoded once a day with OpenStreetMap |
 | `look` | Takes a photo with the front or back camera and answers a question about it. Chimes whenever the camera is used, and photos are deleted right away |
 | `read_sensors` | Room light level, tablet orientation, proximity |
@@ -32,6 +33,7 @@ Conversations carry over for 3 minutes, so follow-ups like "what about tomorrow?
 |---|---|
 | `dean.py` | `~/assistant/dean.py`: main loop (audio, wake word, STT, LLM tool loop, TTS) |
 | `tools.py` | `~/assistant/tools.py`: tool implementations (Termux:API) |
+| `termux/bridge.py` | `~/assistant/bridge.py`: runs Termux:API commands natively for Dean (~0.35 s vs ~2.5 s through proot) |
 | `run.sh` | `~/assistant/run.sh`: supervisor that restarts audio and Dean |
 | `termux/boot-01-services` | `~/.termux/boot/01-services`: runs at boot through Termux:Boot |
 | `termux/bashrc-snippet.sh` | Append to `~/.bashrc`: starts Dean in tmux when Termux is on screen |
@@ -67,13 +69,16 @@ proot-distro install debian
 proot-distro login debian -- bash -c '
   apt-get update && apt-get install -y python3 python3-venv pulseaudio-utils unzip curl &&
   python3 -m venv /opt/dean &&
-  /opt/dean/bin/pip install vosk faster-whisper httpx numpy pillow &&
-  mkdir -p /opt/models && cd /opt/models &&
+  /opt/dean/bin/pip install vosk sherpa-onnx piper-tts httpx numpy pillow &&
+  mkdir -p /opt/models/piper && cd /opt/models &&
   curl -LO https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip &&
-  unzip vosk-model-small-en-us-0.15.zip && rm vosk-model-small-en-us-0.15.zip'
+  unzip vosk-model-small-en-us-0.15.zip && rm vosk-model-small-en-us-0.15.zip &&
+  curl -L https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-base-en-int8.tar.bz2 | tar xj &&
+  cd piper && for f in en_US-lessac-medium.onnx en_US-lessac-medium.onnx.json; do
+    curl -LO https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/$f; done'
 ```
 
-Copy the files into place (the table above lists where each goes) and make `run.sh` and `01-services` executable. The Whisper `base.en` model downloads itself on first run.
+Copy the files into place (the table above lists where each goes) and make `run.sh` and `01-services` executable. `deploy.sh` does this for you once SSH works.
 
 Optional: to manage the tablet over SSH, add your public key to `~/.ssh/authorized_keys` and run `sshd`. It listens on port 8022.
 
@@ -85,6 +90,7 @@ OPENROUTER_API_KEY=sk-or-...
 # optional:
 # DEAN_MODEL=openai/gpt-6.1-sol
 # DEAN_FALLBACK_MODEL=openai/gpt-6.1-sol   # used if DEAN_MODEL is down or removed
+# DEAN_VISION_MODEL=openai/gpt-6.1-sol     # used for camera questions
 # DEAN_EFFORT=low
 # DEAN_LOCATION=Springfield, Illinois    # overrides auto-detected location
 ```
@@ -104,6 +110,20 @@ Test the LLM and tool loop without speaking. Repeated `--ask` flags continue the
 ```bash
 ./deploy.sh <tablet-ip> --ask "What's the weather tomorrow?" --ask "And the day after?"
 ```
+
+## Latency
+
+These were measured on the onn. 12" Tablet Pro and count from when you stop talking.
+
+| Stage | Time |
+|---|---|
+| Detecting you've finished (0.7 s of quiet) | 0.7 s |
+| Speech-to-text, 4-second command (Moonshine base, 2 threads) | 0.3 s |
+| LLM first words (simple question) | ~1.0 s |
+| Weather or sensor question (one tool round) | ~2.5–3.2 s |
+| Piper first audio after a sentence arrives | 0.2–0.7 s |
+
+For comparison, the first version used Whisper `base.en` (2.0 s) and Android TTS (~3.5 s to start), and took about 8 s end to end.
 
 ## Gotchas
 - **Termux must be the app on screen.** Android silences the mic for background apps. Dean detects a muted mic and restarts its audio, which recovers once Termux is back in front. That's why it runs as the full-screen app on the wall.

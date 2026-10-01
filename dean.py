@@ -2,8 +2,8 @@
 """Dean: wall-tablet voice assistant.
 
 Pipeline: mic (PulseAudio) -> "hey dean" wake word (Vosk, on-device)
--> speech-to-text (faster-whisper, on-device) -> LLM via OpenRouter (cloud)
--> Android text-to-speech (termux-tts-speak).
+-> speech-to-text (Moonshine via sherpa-onnx, on-device) -> LLM via OpenRouter,
+streamed (cloud) -> Piper text-to-speech, sentence by sentence (on-device).
 
 Runs inside the Debian proot on the tablet; launched by run.sh.
 """
@@ -13,7 +13,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -26,7 +28,8 @@ _stderr = os.dup(2)
 os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
 try:
     import onnxruntime
-    from faster_whisper import WhisperModel
+    import sherpa_onnx
+    from piper import PiperVoice
 finally:
     os.dup2(_stderr, 2)
     os.close(_stderr)
@@ -41,6 +44,7 @@ TERMUX_BIN = "/data/data/com.termux/files/usr/bin"
 RATE = 16000
 CHUNK = 1600  # 100 ms of 16-bit mono audio = 3200 bytes
 CHUNK_BYTES = CHUNK * 2
+END_SILENCE = 0.7  # seconds of quiet that mean you've finished talking
 
 
 def load_env(path):
@@ -61,6 +65,9 @@ FALLBACK_MODEL = os.environ.get("DEAN_FALLBACK_MODEL", "openai/gpt-6.1-sol")
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 EFFORT = os.environ.get("DEAN_EFFORT", "low")
 LOCATION = os.environ.get("DEAN_LOCATION", "")
+VISION_MODEL = os.environ.get("DEAN_VISION_MODEL", "openai/gpt-6.1-sol")  # camera questions
+MOONSHINE = os.environ.get("DEAN_STT", "/opt/models/sherpa-onnx-moonshine-base-en-int8")
+PIPER_VOICE = os.environ.get("DEAN_VOICE", "/opt/models/piper/en_US-lessac-medium.onnx")
 WAKE_PHRASES = ("hey dean",)
 CONVO_IDLE_RESET = 180  # seconds of quiet before Dean forgets the conversation
 MAX_TURNS = 12  # start a fresh conversation after this many exchanges
@@ -69,11 +76,14 @@ SYSTEM = (
     "You are Dean, a voice assistant on a tablet mounted on the living room wall. "
     "Everything you write is read aloud by a text-to-speech engine, so answer in plain "
     "spoken sentences: no markdown, lists, headings, emoji, URLs, or code. Keep answers "
-    "short (one to three sentences) unless the person asks for detail. Spell out symbols "
+    "short (one or two sentences) unless the person asks for detail. Answer only what was "
+    "asked: if a tool returns extra readings, leave them out, and skip caveats, background, "
+    "and offers of more help. Spell out symbols "
     "and units the way a person would say them. If a request is ambiguous, ask one short "
     "clarifying question. You have tools for the tablet's hardware (camera, sensors, "
     "volume, brightness, flashlight), timers, long-term memory, and web search. Use "
-    "web_search for anything current, like weather, news, scores, store hours, or prices; "
+    "get_weather for local weather and web_search for anything else current, like news, "
+    "scores, store hours, or prices; "
     "never guess those. Only use the camera when the person asks you to look at something. "
     "After using a tool, just give the answer; don't narrate the tool."
 )
@@ -145,11 +155,74 @@ def play(pcm):
                    input=pcm, stderr=subprocess.DEVNULL)
 
 
-def speak(text):
-    try:
-        subprocess.run([f"{TERMUX_BIN}/termux-tts-speak"], input=text.encode(), timeout=120)
-    except subprocess.TimeoutExpired:
-        pass
+SENTENCE_END = re.compile(r"(?<=[.!?;:])\s+")
+
+
+class Voice:
+    """Piper TTS played through PulseAudio. Text can be fed in pieces as it streams
+    from the LLM; each complete sentence is synthesised and played immediately."""
+
+    def __init__(self):
+        self.lock = threading.Lock()  # one speaker at a time (timers speak from threads)
+        try:
+            self.piper = PiperVoice.load(PIPER_VOICE)
+            self.rate = self.piper.config.sample_rate
+            list(self.piper.synthesize("Ready."))  # warm-up: the first synthesis is ~1 s slower
+        except Exception as e:
+            show("warn", f"Piper voice unavailable ({e}); using Android TTS")
+            self.piper = None
+
+    def speak(self, text):
+        u = self.utterance()
+        u.feed(text)
+        u.finish()
+
+    def utterance(self):
+        return Utterance(self)
+
+
+class Utterance:
+    def __init__(self, voice):
+        self.voice, self.buf, self.proc, self.spoken = voice, "", None, False
+        self.first_audio = None  # time.time() when the first sound was queued
+
+    def feed(self, text):
+        self.buf += text
+        parts = SENTENCE_END.split(self.buf)
+        for sentence in parts[:-1]:
+            self._say(sentence)
+        self.buf = parts[-1]
+
+    def finish(self):
+        """Speak whatever is left and block until playback ends."""
+        self._say(self.buf)
+        self.buf = ""
+        if self.proc:
+            self.proc.stdin.close()
+            self.proc.wait()
+            self.proc = None
+            self.voice.lock.release()
+
+    def _say(self, sentence):
+        sentence = sentence.strip()
+        if not sentence:
+            return
+        self.spoken = True
+        v = self.voice
+        if v.piper is None:  # fallback: Android's engine (slow to start, ~3.5 s)
+            with v.lock:
+                self.first_audio = self.first_audio or time.time()
+                subprocess.run([f"{TERMUX_BIN}/termux-tts-speak"], input=sentence.encode())
+            return
+        if self.proc is None:
+            v.lock.acquire()
+            self.proc = subprocess.Popen(
+                ["pacat", "--playback", "--format=s16le", f"--rate={v.rate}", "--channels=1"],
+                stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        for chunk in v.piper.synthesize(sentence):
+            self.first_audio = self.first_audio or time.time()
+            self.proc.stdin.write(chunk.audio_int16_bytes)
+        self.proc.stdin.flush()
 
 
 # ---------- listening ----------
@@ -188,8 +261,9 @@ class Listener:
                 self.wake.Reset()
                 return
 
-    def record_command(self, max_wait=6.0, max_len=15.0, end_silence=0.9):
+    def record_command(self, max_wait=6.0, max_len=15.0, end_silence=None):
         """Record until the speaker pauses. Returns float32 audio or None."""
+        end_silence = end_silence or END_SILENCE
         threshold = max(self.noise * 2.5, 250.0)
         frames, started, quiet = [], False, 0.0
         t0 = time.time()
@@ -214,23 +288,53 @@ class MicMuted(Exception):
     pass
 
 
+# ---------- speech-to-text ----------
+
+class Transcriber:
+    """Moonshine (via sherpa-onnx): cost scales with clip length, ~0.3 s for a
+    4-second command on the Helio G99, vs ~2 s for Whisper base."""
+
+    def __init__(self):
+        d = MOONSHINE
+        self.rec = sherpa_onnx.OfflineRecognizer.from_moonshine(
+            preprocessor=f"{d}/preprocess.onnx", encoder=f"{d}/encode.int8.onnx",
+            uncached_decoder=f"{d}/uncached_decode.int8.onnx",
+            cached_decoder=f"{d}/cached_decode.int8.onnx",
+            tokens=f"{d}/tokens.txt", num_threads=2)
+        self(np.zeros(RATE, dtype=np.float32))  # warm-up so the first command isn't slow
+
+    def __call__(self, audio):
+        s = self.rec.create_stream()
+        s.accept_waveform(RATE, audio)
+        self.rec.decode_stream(s)
+        return s.result.text.strip()
+
+
 # ---------- brain ----------
 
 TOOL_STATUS = {"web_search": "searching the web…", "look": "taking a photo…",
+               "get_weather": "checking the weather…",
                "get_location": "checking location…", "read_sensors": "reading sensors…"}
+
+
+class APIError(Exception):
+    def __init__(self, status, detail):
+        super().__init__(detail)
+        self.status = status
 
 
 class Brain:
     URL = "https://openrouter.ai/api/v1/chat/completions"
 
-    def __init__(self):
-        self.http = httpx.Client(timeout=60.0, headers={
+    def __init__(self, say=None):
+        self.http = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0), headers={
             "Authorization": f"Bearer {API_KEY}",
             "HTTP-Referer": "https://localhost/dean",
             "X-Title": "Dean wall assistant",
         })
         self.models = list(dict.fromkeys([MODEL, FALLBACK_MODEL]))  # shared with the tools
-        self.tools = Toolbox(self.http, self.models, say=speak, chime=lambda: play(CHIME_WAKE))
+        self.tools = Toolbox(self.http, self.models, VISION_MODEL,
+                             say=say or (lambda t: None), chime=lambda: play(CHIME_WAKE))
         self.messages = []
         self.last = 0.0
 
@@ -241,74 +345,123 @@ class Brain:
             parts.append("Things you've been asked to remember: " + " | ".join(mem))
         return " ".join(p for p in parts if p)
 
-    def post(self, body):
+    def stream_round(self, body, on_text):
+        """One streamed request. Returns the assembled assistant message."""
         for attempt in range(3):
-            r = self.http.post(self.URL, json=body)
-            if r.status_code in (400, 404) and len(self.models) > 1 and (
-                    "valid model" in r.text or "No endpoints" in r.text):
-                # preferred model was removed (common for alpha/stealth models): drop it
-                show("warn", f"{self.models[0]} unavailable - using {FALLBACK_MODEL}")
-                self.models[:] = [FALLBACK_MODEL]
-                body["models"] = self.models
-                continue
-            if r.status_code in (429, 500, 502, 503) and attempt < 2:
-                time.sleep(2 * (attempt + 1))
-                continue
-            return r
-        return r
+            with self.http.stream("POST", self.URL, json=body) as r:
+                if r.status_code != 200:
+                    detail = r.read().decode(errors="replace")
+                    if r.status_code in (400, 404) and len(self.models) > 1 and (
+                            "valid model" in detail or "No endpoints" in detail):
+                        # preferred model was removed (common for alpha/stealth models)
+                        show("warn", f"{self.models[0]} unavailable - using {FALLBACK_MODEL}")
+                        self.models[:] = [FALLBACK_MODEL]
+                        body["models"] = self.models
+                        continue
+                    if r.status_code in (429, 500, 502, 503) and attempt < 2:
+                        time.sleep(2 * (attempt + 1))
+                        continue
+                    raise APIError(r.status_code, detail[:200])
+                content, calls, reasoning = "", {}, {}
+                for line in r.iter_lines():
+                    if not line.startswith("data: "):
+                        continue  # keep-alive comments
+                    payload = line[6:]
+                    if payload == "[DONE]":
+                        break
+                    d = json.loads(payload)
+                    if "error" in d:
+                        raise APIError(d["error"].get("code", 0), str(d["error"]))
+                    delta = ((d.get("choices") or [{}])[0]).get("delta") or {}
+                    if delta.get("content"):
+                        content += delta["content"]
+                        on_text(delta["content"])
+                    for tc in delta.get("tool_calls") or []:
+                        slot = calls.setdefault(tc.get("index", 0), {
+                            "id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                        slot["id"] = tc.get("id") or slot["id"]
+                        fn = tc.get("function") or {}
+                        slot["function"]["name"] += fn.get("name") or ""
+                        slot["function"]["arguments"] += fn.get("arguments") or ""
+                    # reasoning_details must go back with tool results so the model can
+                    # continue its thinking; pieces of one item share an index
+                    for rd in delta.get("reasoning_details") or []:
+                        cur = reasoning.setdefault(rd.get("index", len(reasoning)), {})
+                        for k, v in rd.items():
+                            if k in ("text", "summary", "data") and isinstance(v, str):
+                                cur[k] = cur.get(k, "") + v
+                            else:
+                                cur[k] = v
+                msg = {"role": "assistant", "content": content or None}
+                if calls:
+                    msg["tool_calls"] = [calls[i] for i in sorted(calls)]
+                if reasoning:
+                    msg["reasoning_details"] = [reasoning[i] for i in sorted(reasoning)]
+                return msg
+        raise APIError(503, "retries exhausted")
 
-    def ask(self, text):
+    def run_tool(self, call):
+        name = call["function"]["name"]
+        try:
+            args = json.loads(call["function"].get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        show("status", TOOL_STATUS.get(name, f"{name.replace('_', ' ')}…"))
+        return self.tools.call(name, args)
+
+    def ask(self, text, on_text=lambda t: None):
+        """Answer `text`, streaming spoken text to on_text as it arrives."""
         if time.time() - self.last > CONVO_IDLE_RESET or len(self.messages) >= MAX_TURNS * 6:
             self.messages = []
         start = len(self.messages)
         now = datetime.now().strftime("%A, %B %d, %Y, %I:%M %p")
         self.messages.append({"role": "user", "content": f"[Local time: {now}]\n{text}"})
+        spoken = []
+
+        def emit(t):
+            spoken.append(t)
+            on_text(t)
+
         try:
             for _ in range(6):  # model may chain a few tool calls before answering
-                r = self.post({
+                msg = self.stream_round({
                     "models": self.models,
                     "messages": [{"role": "system", "content": self.system()}] + self.messages,
                     "tools": TOOLS,
                     "max_tokens": 4000,
                     "reasoning": {"effort": EFFORT},
-                })
-                if r.status_code != 200:
-                    del self.messages[start:]
-                    show("err", f"OpenRouter {r.status_code}: {r.text[:200]}")
-                    return {401: "My OpenRouter key isn't working. Please check the key file.",
-                            402: "The OpenRouter account is out of credits.",
-                            429: "I'm being rate limited right now. Try again in a minute."
-                            }.get(r.status_code, "Something went wrong reaching the AI. Try again.")
-                data = r.json()
-                if "error" in data or not data.get("choices"):
-                    del self.messages[start:]
-                    show("err", f"OpenRouter: {data.get('error', data)}")
-                    return "Something went wrong reaching the AI. Try again."
-                msg = data["choices"][0]["message"]
-                # keep reasoning_details so the model can continue its thinking after tools
-                self.messages.append({k: v for k, v in msg.items()
-                                      if k in ("role", "content", "tool_calls", "reasoning_details")})
+                    "stream": True,
+                }, emit)
+                self.messages.append(msg)
                 calls = msg.get("tool_calls") or []
                 if not calls:
                     self.last = time.time()
-                    reply = (msg.get("content") or "").strip()
-                    return reply or "Sorry, I didn't catch an answer to that."
-                for call in calls:
-                    name = call["function"]["name"]
-                    try:
-                        args = json.loads(call["function"].get("arguments") or "{}")
-                    except json.JSONDecodeError:
-                        args = {}
-                    show("status", TOOL_STATUS.get(name, f"{name.replace('_', ' ')}…"))
-                    result = self.tools.call(name, args)
+                    return "".join(spoken).strip()
+                # run this round's tool calls at the same time; results go back in order
+                with ThreadPoolExecutor(max(1, len(calls))) as pool:
+                    results = list(pool.map(self.run_tool, calls))
+                for call, result in zip(calls, results):
                     self.messages.append({"role": "tool", "tool_call_id": call["id"],
                                           "content": json.dumps(result)[:8000]})
             del self.messages[start:]
-            return "Sorry, that took too many steps. Try asking a simpler way."
-        except httpx.HTTPError as e:
+            return self._fail(emit, spoken, "Sorry, that took too many steps. Try asking a simpler way.")
+        except APIError as e:
+            del self.messages[start:]
+            show("err", f"OpenRouter {e.status}: {e}")
+            return self._fail(emit, spoken, {
+                401: "My OpenRouter key isn't working. Please check the key file.",
+                402: "The OpenRouter account is out of credits.",
+                429: "I'm being rate limited right now. Try again in a minute.",
+            }.get(e.status, "Something went wrong reaching the AI. Try again."))
+        except (httpx.HTTPError, json.JSONDecodeError) as e:
             del self.messages[start:]
             show("err", f"network: {e}")
-            return "I can't reach the internet right now."
+            return self._fail(emit, spoken, "I can't reach the internet right now.")
+
+    @staticmethod
+    def _fail(emit, spoken, message):
+        emit((" " if spoken else "") + message)
+        return "".join(spoken).strip()
 
 
 # ---------- main loop ----------
@@ -321,7 +474,11 @@ def text_mode(questions):
     brain = Brain()
     for q in questions:
         show("you", q)
-        show("dean", brain.ask(q))
+        t0, first = time.time(), []
+        reply = brain.ask(q, on_text=lambda t: first or first.append(time.time() - t0))
+        show("dean", reply)
+        show("status", f"first words after {first[0]:.2f}s, done after {time.time() - t0:.2f}s"
+             if first else f"done after {time.time() - t0:.2f}s")
     return 0
 
 
@@ -329,9 +486,10 @@ def main():
     SetLogLevel(-1)
     os.system("clear")
     print(f"{C['bold']}{C['green']}  DEAN{C['off']}{C['dim']}  ·  say \"hey dean\"{C['off']}\n")
+    voice = None
     if not API_KEY.startswith("sk-or-"):
         show("err", "No valid API key yet. Put OPENROUTER_API_KEY=sk-or-... in ~/.dean.env")
-        speak("I need an API key before I can work.")
+        Voice().speak("I need an API key before I can work.")
         key_file = Path("/data/data/com.termux/files/home/.dean.env")
         seen = key_file.stat().st_mtime if key_file.exists() else 0
         while (key_file.stat().st_mtime if key_file.exists() else 0) == seen:
@@ -339,12 +497,12 @@ def main():
         return 2
 
     show("status", "loading speech models…")
-    whisper = WhisperModel("base.en", device="cpu", compute_type="int8", cpu_threads=4,
-                           download_root="/opt/models/whisper")
+    transcribe = Transcriber()
+    voice = Voice()
     mic = Mic()
     mic.start()
     ear = Listener(mic)
-    brain = Brain()
+    brain = Brain(say=voice.speak)
     show("status", f"ready  ({MODEL}, effort {EFFORT})")
     where = brain.tools.place_line()
     show("status", where or "location unknown")
@@ -361,9 +519,8 @@ def main():
             show("status", "didn't hear anything")
             play(CHIME_DONE)
             continue
-        segments, _ = whisper.transcribe(audio, beam_size=1, language="en",
-                                         vad_filter=True, initial_prompt="Hey Dean,")
-        text = " ".join(s.text for s in segments).strip()
+        heard = time.time() - END_SILENCE  # you stopped talking this long ago
+        text = transcribe(audio)
         if is_just_wake_word(text):
             # the tail of "hey dean" got recorded; the real question comes next
             audio = ear.record_command()
@@ -371,17 +528,24 @@ def main():
                 show("status", "didn't hear anything")
                 play(CHIME_DONE)
                 continue
-            segments, _ = whisper.transcribe(audio, beam_size=1, language="en", vad_filter=True)
-            text = " ".join(s.text for s in segments).strip()
+            heard = time.time() - END_SILENCE  # you stopped talking this long ago
+            text = transcribe(audio)
         if not text or is_just_wake_word(text):
             show("status", "couldn't make that out")
             play(CHIME_DONE)
             continue
+        stt = time.time() - heard
         show("you", text)
         mic.stop()  # don't listen to ourselves while thinking/speaking
-        reply = brain.ask(text)
+        utt = voice.utterance()
+        reply = brain.ask(text, on_text=utt.feed)
         show("dean", reply)
-        speak(reply)
+        if not utt.spoken and not utt.buf.strip():
+            utt.feed(reply)
+        utt.finish()
+        if utt.first_audio:
+            show("status", f"speech-to-text {stt:.1f}s · first word {utt.first_audio - heard:.1f}s "
+                           "after you stopped talking")
         mic.start()
         # if Dean asked something, listen for the answer without needing "hey dean"
         follow_up = reply.rstrip().endswith("?")

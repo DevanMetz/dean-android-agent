@@ -6,9 +6,11 @@ import base64
 import io
 import json
 import math
+import socket
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -20,13 +22,30 @@ DATA = Path("/data/data/com.termux/files/home/assistant")
 MEMORY_FILE = DATA / "memory.json"
 PLACE_FILE = DATA / "place.json"
 PHOTO = DATA / "snap.jpg"
+BRIDGE = DATA / "bridge.sock"  # termux/bridge.py, running natively in Termux
 OPENROUTER = "https://openrouter.ai/api/v1/chat/completions"
 
 
+def _run(args, timeout, stdin):
+    """Run a Termux:API command, via the native bridge when it's up (~0.35 s)
+    instead of starting it under proot (~2.5 s)."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout + 5)
+            s.connect(str(BRIDGE))
+            s.sendall(json.dumps({"args": list(args), "stdin": stdin, "timeout": timeout}).encode() + b"\n")
+            reply = json.loads(s.makefile().readline())
+        if reply.get("error"):
+            raise RuntimeError(reply["error"])
+        return reply["stdout"]
+    except (FileNotFoundError, ConnectionRefusedError):
+        r = subprocess.run([f"{TERMUX_BIN}/{args[0]}", *args[1:]], capture_output=True,
+                           text=True, timeout=timeout, input=stdin)
+        return r.stdout
+
+
 def termux(*args, timeout=30, stdin=None):
-    r = subprocess.run([f"{TERMUX_BIN}/{args[0]}", *args[1:]], capture_output=True,
-                       text=True, timeout=timeout, input=stdin)
-    out = r.stdout.strip()
+    out = _run(args, timeout, stdin).strip()
     try:
         result = json.loads(out) if out else {}
     except json.JSONDecodeError:
@@ -38,9 +57,10 @@ def termux(*args, timeout=30, stdin=None):
 
 
 class Toolbox:
-    def __init__(self, http, models, say, chime):
+    def __init__(self, http, models, vision_model, say, chime):
         self.http = http  # httpx.Client with the OpenRouter key
         self.models = models  # preferred model first, then fallbacks
+        self.vision_model = vision_model  # used for camera questions
         self.say = say  # speak(text) - used by timers
         self.chime = chime
         self.timers = {}
@@ -97,7 +117,7 @@ class Toolbox:
         PHOTO.unlink(missing_ok=True)  # don't keep photos around
         b64 = base64.b64encode(buf.getvalue()).decode()
         r = self.http.post(OPENROUTER, json={
-            "models": self.models, "max_tokens": 1500, "reasoning": {"effort": "low", "exclude": True},
+            "model": self.vision_model, "max_tokens": 1500, "reasoning": {"effort": "low", "exclude": True},
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": "This photo was just taken by a wall-mounted tablet's "
                  f"{camera} camera. Answer briefly and concretely: {question}"},
@@ -128,9 +148,9 @@ class Toolbox:
         return out
 
     def device_status(self):
-        b = termux("termux-battery-status")
-        w = termux("termux-wifi-connectioninfo")
-        v = termux("termux-volume")
+        with ThreadPoolExecutor(3) as pool:
+            b, w, v = pool.map(termux, ("termux-battery-status", "termux-wifi-connectioninfo",
+                                        "termux-volume"))
         music = next((x for x in v if x.get("stream") == "music"), {}) if isinstance(v, list) else {}
         return {
             "battery_percent": b.get("percentage"), "charging": b.get("status"),
@@ -209,13 +229,59 @@ class Toolbox:
         MEMORY_FILE.write_text(json.dumps(keep, indent=1))
         return {"forgot": len(m) - len(keep)}
 
+    # ----- weather -----
+
+    WMO = {0: "clear", 1: "mostly clear", 2: "partly cloudy", 3: "overcast", 45: "fog",
+           48: "freezing fog", 51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+           56: "freezing drizzle", 57: "freezing drizzle", 61: "light rain", 63: "rain",
+           65: "heavy rain", 66: "freezing rain", 67: "freezing rain", 71: "light snow",
+           73: "snow", 75: "heavy snow", 77: "snow grains", 80: "light showers", 81: "showers",
+           82: "violent showers", 85: "snow showers", 86: "heavy snow showers",
+           95: "thunderstorms", 96: "thunderstorms with hail", 99: "thunderstorms with hail"}
+
+    def get_weather(self, days=3):
+        """Current conditions and daily forecast from Open-Meteo (free, no key)."""
+        p = self.place()
+        if not p:
+            return {"error": "location unknown"}
+        us = p.get("country") in (None, "United States")
+        r = httpx.get("https://api.open-meteo.com/v1/forecast", timeout=10, params={
+            "latitude": p["lat"], "longitude": p["lon"], "timezone": "auto",
+            "forecast_days": max(1, min(int(days), 7)),
+            "temperature_unit": "fahrenheit" if us else "celsius",
+            "wind_speed_unit": "mph" if us else "kmh",
+            "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m",
+            "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
+                     "precipitation_probability_max,precipitation_sum,wind_speed_10m_max,sunrise,sunset",
+        })
+        r.raise_for_status()
+        d, c = r.json()["daily"], r.json()["current"]
+        unit = "F" if us else "C"
+        return {
+            "place": p.get("city"),
+            "now": {"temp": f"{c['temperature_2m']}{unit}", "feels_like": f"{c['apparent_temperature']}{unit}",
+                    "conditions": self.WMO.get(c["weather_code"], "unknown"),
+                    "wind": f"{c['wind_speed_10m']} {'mph' if us else 'km/h'}",
+                    "humidity": f"{c['relative_humidity_2m']}%"},
+            "days": [{"date": datetime.fromisoformat(day).strftime("%A %b %d"),
+                      "conditions": self.WMO.get(d["weather_code"][i], "unknown"),
+                      "high": f"{d['temperature_2m_max'][i]}{unit}", "low": f"{d['temperature_2m_min'][i]}{unit}",
+                      "chance_of_precipitation": f"{d['precipitation_probability_max'][i]}%",
+                      "precipitation": d["precipitation_sum"][i],
+                      "max_wind": d["wind_speed_10m_max"][i],
+                      "sunrise": d["sunrise"][i][-5:], "sunset": d["sunset"][i][-5:]}
+                     for i, day in enumerate(d["time"])],
+        }
+
     # ----- web -----
 
     def web_search(self, query):
         r = self.http.post(OPENROUTER, json={
-            "models": self.models, "max_tokens": 1500, "reasoning": {"effort": "low", "exclude": True},
+            "models": self.models, "max_tokens": 1500,
+            "reasoning": {"effort": "minimal", "exclude": True},
             "plugins": [{"id": "web", "max_results": 4}],
             "messages": [{"role": "user", "content":
+                          f"Today is {datetime.now().strftime('%A, %B %d, %Y, %I:%M %p')}. "
                           f"{self.place_line()} Search the web and give a short factual answer "
                           f"(include specific numbers, names and times): {query}"}]}, timeout=60)
         r.raise_for_status()
@@ -240,8 +306,13 @@ def _tool(name, description, props=None, required=()):
 
 
 TOOLS = [
-    _tool("web_search", "Search the web for current information: weather, news, sports, "
-          "business hours, prices, events, anything that may have changed recently.",
+    _tool("get_weather", "Weather at the tablet's location: current conditions plus a daily "
+          "forecast (highs, lows, rain chance, wind, sunrise and sunset). Fast; use this for any "
+          "local weather question instead of web_search.",
+          {"days": {"type": "integer", "minimum": 1, "maximum": 7,
+                    "description": "Days of forecast including today (default 3)."}}),
+    _tool("web_search", "Search the web for current information: news, sports, business hours, "
+          "prices, events, weather elsewhere, anything that may have changed recently.",
           {"query": {"type": "string"}}, ["query"]),
     _tool("get_location", "Get the tablet's current location (city, state, coordinates).",
           {"refresh": {"type": "boolean", "description": "Force a fresh location fix."}}),
