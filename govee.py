@@ -98,6 +98,8 @@ class Govee:
             hits = [l for l in self.lights
                     if any(w in (l["name"] + " " + " ".join(l.get("aliases", []))).lower()
                            for w in words)]
+        if not hits and len(self.lights) == 1:
+            hits = list(self.lights)  # only one light: any light request means that one
         return hits
 
     # ----- LAN -----

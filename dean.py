@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -85,7 +86,12 @@ SYSTEM = (
     "get_weather for local weather and web_search for anything else current, like news, "
     "scores, store hours, or prices; "
     "never guess those. Only use the camera when the person asks you to look at something. "
-    "After using a tool, just give the answer; don't narrate the tool."
+    "After using a tool, just give the answer; don't narrate the tool. "
+    "The person's words reach you through speech recognition and are sometimes misheard "
+    "(\"turn my rims later\" was really \"turn my room's light off\"). Work out what they "
+    "most likely said from how it sounds and the context, and act on it. Changing lights, "
+    "volume or brightness is harmless and easy to undo, so for those make your best guess and "
+    "do it rather than asking. Never ask which device they mean when only one fits."
 )
 
 
@@ -290,6 +296,20 @@ class MicMuted(Exception):
 
 # ---------- speech-to-text ----------
 
+LAST_COMMAND = Path("/tmp/dean-last-command.wav")  # newest command only, for debugging
+
+
+def save_last_command(audio):
+    try:
+        with wave.open(str(LAST_COMMAND), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(RATE)
+            w.writeframes((np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes())
+    except OSError:
+        pass
+
+
 class Transcriber:
     """Moonshine (via sherpa-onnx): cost scales with clip length, ~0.3 s for a
     4-second command on the Helio G99, vs ~2 s for Whisper base."""
@@ -304,6 +324,11 @@ class Transcriber:
         self(np.zeros(RATE, dtype=np.float32))  # warm-up so the first command isn't slow
 
     def __call__(self, audio):
+        # this tablet's mic records quietly; bring speech up to a consistent level
+        peak = float(np.abs(audio).max()) if audio.size else 0.0
+        if 0 < peak < 0.5:
+            audio = audio * min(0.5 / peak, 20.0)
+        save_last_command(audio)
         s = self.rec.create_stream()
         s.accept_waveform(RATE, audio)
         self.rec.decode_stream(s)
