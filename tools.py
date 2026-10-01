@@ -38,9 +38,9 @@ def termux(*args, timeout=30, stdin=None):
 
 
 class Toolbox:
-    def __init__(self, http, model, say, chime):
+    def __init__(self, http, models, say, chime):
         self.http = http  # httpx.Client with the OpenRouter key
-        self.model = model
+        self.models = models  # preferred model first, then fallbacks
         self.say = say  # speak(text) - used by timers
         self.chime = chime
         self.timers = {}
@@ -97,7 +97,7 @@ class Toolbox:
         PHOTO.unlink(missing_ok=True)  # don't keep photos around
         b64 = base64.b64encode(buf.getvalue()).decode()
         r = self.http.post(OPENROUTER, json={
-            "model": self.model, "max_tokens": 1500, "reasoning": {"effort": "low", "exclude": True},
+            "models": self.models, "max_tokens": 1500, "reasoning": {"effort": "low", "exclude": True},
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": "This photo was just taken by a wall-mounted tablet's "
                  f"{camera} camera. Answer briefly and concretely: {question}"},
@@ -213,7 +213,7 @@ class Toolbox:
 
     def web_search(self, query):
         r = self.http.post(OPENROUTER, json={
-            "model": self.model, "max_tokens": 1500, "reasoning": {"effort": "low", "exclude": True},
+            "models": self.models, "max_tokens": 1500, "reasoning": {"effort": "low", "exclude": True},
             "plugins": [{"id": "web", "max_results": 4}],
             "messages": [{"role": "user", "content":
                           f"{self.place_line()} Search the web and give a short factual answer "

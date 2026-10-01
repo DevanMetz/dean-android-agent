@@ -19,11 +19,19 @@ from pathlib import Path
 
 import httpx
 import numpy as np
-import onnxruntime
-from faster_whisper import WhisperModel
 
-onnxruntime.set_default_logger_severity(3)  # hide harmless GPU-discovery warnings
-from vosk import KaldiRecognizer, Model, SetLogLevel
+# onnxruntime prints a harmless GPU-discovery warning straight to stderr while
+# loading; mute fd 2 for the import only.
+_stderr = os.dup(2)
+os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
+try:
+    import onnxruntime
+    from faster_whisper import WhisperModel
+finally:
+    os.dup2(_stderr, 2)
+    os.close(_stderr)
+onnxruntime.set_default_logger_severity(3)
+from vosk import KaldiRecognizer, Model, SetLogLevel  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tools import TOOLS, Toolbox  # noqa: E402
@@ -48,6 +56,8 @@ load_env(Path.home() / ".dean.env")
 load_env(Path("/data/data/com.termux/files/home/.dean.env"))
 
 MODEL = os.environ.get("DEAN_MODEL", "openai/gpt-6.1-sol")
+# OpenRouter switches to this automatically if MODEL is down or removed
+FALLBACK_MODEL = os.environ.get("DEAN_FALLBACK_MODEL", "openai/gpt-6.1-sol")
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 EFFORT = os.environ.get("DEAN_EFFORT", "low")
 LOCATION = os.environ.get("DEAN_LOCATION", "")
@@ -219,7 +229,8 @@ class Brain:
             "HTTP-Referer": "https://localhost/dean",
             "X-Title": "Dean wall assistant",
         })
-        self.tools = Toolbox(self.http, MODEL, say=speak, chime=lambda: play(CHIME_WAKE))
+        self.models = list(dict.fromkeys([MODEL, FALLBACK_MODEL]))  # shared with the tools
+        self.tools = Toolbox(self.http, self.models, say=speak, chime=lambda: play(CHIME_WAKE))
         self.messages = []
         self.last = 0.0
 
@@ -233,10 +244,18 @@ class Brain:
     def post(self, body):
         for attempt in range(3):
             r = self.http.post(self.URL, json=body)
+            if r.status_code in (400, 404) and len(self.models) > 1 and (
+                    "valid model" in r.text or "No endpoints" in r.text):
+                # preferred model was removed (common for alpha/stealth models): drop it
+                show("warn", f"{self.models[0]} unavailable - using {FALLBACK_MODEL}")
+                self.models[:] = [FALLBACK_MODEL]
+                body["models"] = self.models
+                continue
             if r.status_code in (429, 500, 502, 503) and attempt < 2:
                 time.sleep(2 * (attempt + 1))
                 continue
             return r
+        return r
 
     def ask(self, text):
         if time.time() - self.last > CONVO_IDLE_RESET or len(self.messages) >= MAX_TURNS * 6:
@@ -247,7 +266,7 @@ class Brain:
         try:
             for _ in range(6):  # model may chain a few tool calls before answering
                 r = self.post({
-                    "model": MODEL,
+                    "models": self.models,
                     "messages": [{"role": "system", "content": self.system()}] + self.messages,
                     "tools": TOOLS,
                     "max_tokens": 4000,

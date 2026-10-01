@@ -84,6 +84,7 @@ Create `~/.dean.env` in Termux:
 OPENROUTER_API_KEY=sk-or-...
 # optional:
 # DEAN_MODEL=openai/gpt-6.1-sol
+# DEAN_FALLBACK_MODEL=openai/gpt-6.1-sol   # used if DEAN_MODEL is down or removed
 # DEAN_EFFORT=low
 # DEAN_LOCATION=Springfield, Illinois    # overrides auto-detected location
 ```
