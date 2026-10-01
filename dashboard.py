@@ -62,6 +62,7 @@ class Dashboard:
         self.state = 'Say "hey Dean"'
         self.weather = None
         self.lights = []
+        self.sensors = []
         threading.Thread(target=self._refresh, daemon=True, name="dash-data").start()
         threading.Thread(target=self._draw_loop, daemon=True, name="dash-draw").start()
 
@@ -85,6 +86,11 @@ class Dashboard:
                     last_weather = time.time()
                 except Exception:
                     pass
+            try:
+                s = self.tb.climate_sensors()
+                self.sensors = s if isinstance(s, list) else []
+            except Exception:
+                pass
             try:
                 lights = []
                 for light in self.tb.govee.lights:
@@ -131,6 +137,11 @@ class Dashboard:
             out.append(f"  {C['bold']}{deg(n.get('temp'))}{C['off']} {n.get('conditions', '')}  "
                        f"{C['dim']}·{C['off']}  high {deg(d.get('high'))}  low {deg(d.get('low'))}  "
                        f"{C['dim']}·{C['off']}  {d.get('chance_of_precipitation', '?')} rain")
+        for s in self.sensors:
+            out.append(f"  {C['bold']}{deg(s['temperature'].rstrip('°FC'))}{C['off']} "
+                       f"{s['name']}  {C['dim']}·{C['off']}  {s['humidity']} humidity"
+                       + (f"  {C['dim']}(heard {s['last_heard']}){C['off']}"
+                          if s["last_heard"] != "just now" else ""))
         if self.lights:
             parts = []
             for name, s in self.lights:

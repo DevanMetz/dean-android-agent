@@ -29,6 +29,8 @@ DATA = Path("/data/data/com.termux/files/home/assistant")
 MEMORY_FILE = DATA / "memory.json"
 PLACE_FILE = DATA / "place.json"
 PHOTO = DATA / "snap.jpg"
+SENSORS_FILE = DATA / "sensors.json"  # {"GVH5075_ABCD": "balcony"}
+SENSOR_APP = "http://127.0.0.1:8765/"  # android/dean-sensors, running on this tablet
 BRIDGE = DATA / "bridge.sock"  # termux/bridge.py, running natively in Termux
 OPENROUTER = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -339,6 +341,33 @@ class Toolbox:
         return {"phone": "iPhone", "ringing": True,
                 "note": "the iPhone gets the email in a few seconds, then its shortcut plays sound"}
 
+    # ----- Bluetooth thermometers (via the Dean Sensors app) -----
+
+    def climate_sensors(self):
+        try:
+            data = httpx.get(SENSOR_APP, timeout=3).json()
+        except Exception:
+            return {"error": "the Dean Sensors app isn't running on the tablet"}
+        names = json.loads(SENSORS_FILE.read_text()) if SENSORS_FILE.exists() else {}
+        sensors = data.get("sensors", [])
+        default = os.environ.get("DEAN_SENSOR_DEFAULT_NAME", "balcony")
+        out = []
+        for s in sensors:
+            name = names.get(s["name"]) or (default if len(sensors) == 1 else s["name"])
+            age = int(time.time() - s["time"])
+            us = (self.place().get("country") or "United States") == "United States"
+            out.append({
+                "name": name,
+                "temperature": f"{s['temp_f']}°F" if us else f"{s['temp_c']}°C",
+                "humidity": f"{s['humidity']}%",
+                "battery": f"{s['battery']}%",
+                "last_heard": "just now" if age < 120 else f"{age // 60} minutes ago",
+            })
+        if not out:
+            return {"error": "no thermometer heard yet; it may be out of the tablet's Bluetooth "
+                             "range", "bluetooth_broadcasts_heard": data.get("adverts_heard")}
+        return out
+
     # ----- weather -----
 
     WMO = {0: "clear", 1: "mostly clear", 2: "partly cloudy", 3: "overcast", 45: "fog",
@@ -445,6 +474,9 @@ TOOLS = [
           {"phone": {"type": "string", "enum": ["pixel", "iphone"]},
            "stop": {"type": "boolean", "description": "Stop ringing instead."}},
           ["phone"]),
+    _tool("climate_sensors", "Temperature, humidity and battery from the household's Govee "
+          "Bluetooth thermometers (e.g. the one on the balcony). Use for 'how warm is it on the "
+          "balcony'; use get_weather for the forecast.",),
     _tool("get_location", "Get the tablet's current location (city, state, coordinates).",
           {"refresh": {"type": "boolean", "description": "Force a fresh location fix."}}),
     _tool("look", "Take a photo with the tablet camera and answer a question about it. Only use "

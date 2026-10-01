@@ -11,3 +11,7 @@ android/dean-finder/build/
 android/dean-finder/*.apk
 android/dean-finder/*.keystore
 android/dean-finder/*.idsig
+android/dean-sensors/build/
+android/dean-sensors/*.apk
+android/dean-sensors/*.keystore
+android/dean-sensors/*.idsig

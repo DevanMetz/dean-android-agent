@@ -19,6 +19,7 @@ The model gets these tools and decides when to use them:
 | `get_weather` | Current conditions and 1–7 day forecast from [Open-Meteo](https://open-meteo.com), free with no key, ~0.3 s |
 | `lights` | Govee lights: on/off, brightness, color, warm/cool white, or current state. Uses the LAN API where enabled (~50 ms) and the Govee cloud API otherwise |
 | `find_phone` | Rings the Pixel through the Dean Finder app, or the iPhone through an email-triggered Shortcut. Both ring even on silent |
+| `climate_sensors` | Temperature, humidity and battery from Govee Bluetooth thermometers (H5075 and similar), read by the Dean Sensors app |
 | `get_location` | City and coordinates from Android network location, reverse-geocoded once a day with OpenStreetMap |
 | `look` | Takes a photo with the front or back camera and answers a question about it. Chimes whenever the camera is used, and photos are deleted right away |
 | `read_sensors` | Room light level, tablet orientation, proximity |
@@ -124,6 +125,15 @@ The Termux screen shows a big clock, the date, the current weather and today's f
 3. Message your bot. It refuses unknown chats and tells you your chat ID, which also appears on the tablet. Add `TELEGRAM_ALLOWED_CHATS=<id>` (comma-separate several IDs) and restart.
 
 Each chat keeps its own conversation. Reminders set by text are texted back to you, and `announce` speaks at home. The camera is off over text so nobody at home is photographed without knowing; set `DEAN_TELEGRAM_CAMERA=1` to allow it.
+
+## Bluetooth thermometers (Govee H5075 and similar)
+
+Termux can't use Bluetooth, so a small companion app on the tablet does it: `android/dean-sensors` (plain Java, no libraries).
+- It listens for Govee thermo-hygrometer broadcasts (manufacturer ID `0xEC88`; no pairing needed) and decodes temperature, humidity and battery.
+- It serves the latest reading per sensor at `http://127.0.0.1:8765/`, reachable only on the tablet.
+- To build and install it: run `android/dean-sensors/build.sh`, then `adb install -r -g dean-sensors.apk`, then `adb shell dumpsys deviceidle whitelist +com.dean.sensors`. Start it with `adb shell am broadcast -n com.dean.sensors/.BootReceiver -a com.dean.sensors.START`, and it starts itself after reboots.
+- To name sensors, put them in `~/assistant/sensors.json`, e.g. `{"GVH5075_ABCD": "balcony"}`. A single unnamed sensor is called `DEAN_SENSOR_DEFAULT_NAME` (default "balcony").
+- The sensor has to be within Bluetooth range of the tablet, which is usually around 10 m and less through exterior walls.
 
 ## Finding phones
 
