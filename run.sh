@@ -15,7 +15,8 @@ while true; do
   # native helper that runs Termux:API commands quickly for Dean (see bridge.py)
   # (one supervisor loop, named "dean-bridge-loop", restarts it if it ever dies)
   pgrep -f "[d]ean-bridge-loop" >/dev/null ||
-    bash -c 'while true; do python3 ~/assistant/bridge.py; sleep 2; done' dean-bridge-loop &
+    bash -c 'while true; do python3 ~/assistant/bridge.py 2>>"$PREFIX/tmp/bridge.log"; sleep 2; done' \
+      dean-bridge-loop >/dev/null &
   proot-distro login debian -- env TZ="$TZ_NAME" PULSE_SERVER="unix:$PULSE_SOCKET" \
     /opt/dean/bin/python /data/data/com.termux/files/home/assistant/dean.py
   echo "Dean stopped (exit $?) - restarting in 5s..."

@@ -42,7 +42,10 @@ class Handler(socketserver.StreamRequestHandler):
             reply = {"rc": -1, "stdout": "", "error": "timed out"}
         except Exception as e:
             reply = {"rc": -1, "stdout": "", "error": f"{type(e).__name__}: {e}"}
-        self.wfile.write(json.dumps(reply).encode() + b"\n")
+        try:
+            self.wfile.write(json.dumps(reply).encode() + b"\n")
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the caller gave up waiting
 
 
 class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):

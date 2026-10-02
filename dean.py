@@ -8,9 +8,11 @@ streamed (cloud) -> Piper text-to-speech, sentence by sentence (on-device).
 Runs inside the Debian proot on the tablet; launched by run.sh.
 """
 
+import faulthandler
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -509,6 +511,14 @@ class Interrupted(Exception):
     pass
 
 
+class Stalled(Exception):
+    """The model kept the connection open (OpenRouter keep-alives) but stopped producing."""
+
+
+STALL_SECS = 20   # no content, tool call or reasoning for this long -> give up on the round
+ROUND_SECS = 60   # hard cap for one streamed round
+
+
 class APIError(Exception):
     def __init__(self, status, detail):
         super().__init__(detail)
@@ -559,9 +569,13 @@ class Brain:
                         continue
                     raise APIError(r.status_code, detail[:200])
                 content, calls, reasoning = "", {}, {}
+                started = progressed = time.time()
                 for line in r.iter_lines():
                     if should_stop():
                         raise Interrupted()
+                    now = time.time()
+                    if now - progressed > STALL_SECS or now - started > ROUND_SECS:
+                        raise Stalled(f"{now - started:.0f} s with no answer")
                     if not line.startswith("data: "):
                         continue  # keep-alive comments
                     payload = line[6:]
@@ -571,6 +585,9 @@ class Brain:
                     if "error" in d:
                         raise APIError(d["error"].get("code", 0), str(d["error"]))
                     delta = ((d.get("choices") or [{}])[0]).get("delta") or {}
+                    if delta.get("content") or delta.get("tool_calls") or delta.get("reasoning") \
+                            or delta.get("reasoning_details"):
+                        progressed = now
                     if delta.get("content"):
                         content += delta["content"]
                         on_text(delta["content"])
@@ -627,14 +644,21 @@ class Brain:
 
         try:
             for _ in range(6):  # model may chain a few tool calls before answering
-                msg = self.stream_round({
+                body = {
                     "models": self.models,
                     "messages": [{"role": "system", "content": self.system()}] + self.messages,
                     "tools": self.tool_specs,
                     "max_tokens": 4000,
                     "reasoning": {"effort": EFFORT},
                     "stream": True,
-                }, emit, should_stop)
+                }
+                try:
+                    msg = self.stream_round(body, emit, should_stop)
+                except Stalled as e:
+                    if self.models == [FALLBACK_MODEL]:
+                        raise APIError(504, f"model stalled ({e})")
+                    show("warn", f"{self.models[0]} stalled ({e}); retrying on {FALLBACK_MODEL}")
+                    msg = self.stream_round(dict(body, models=[FALLBACK_MODEL]), emit, should_stop)
                 new_round[0] = True
                 self.messages.append(msg)
                 calls = msg.get("tool_calls") or []
@@ -679,7 +703,7 @@ class Brain:
 
 
 def openrouter_client():
-    return httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0), headers={
+    return httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0), headers={
         "Authorization": f"Bearer {API_KEY}",
         "HTTP-Referer": "https://localhost/dean",
         "X-Title": "Dean wall assistant",
@@ -952,6 +976,9 @@ def text_mode(questions):
 
 def main():
     global DASH
+    # `kill -USR1 <pid>` writes every thread's stack to /tmp/dean-stacks.txt (for hangs)
+    faulthandler.register(signal.SIGUSR1, file=open("/tmp/dean-stacks.txt", "w"),
+                          all_threads=True)
     SetLogLevel(-1)
     os.system("clear")
     print(f"{C['bold']}{C['green']}  DEAN{C['off']}{C['dim']}  ·  say \"hey dean\"{C['off']}\n")

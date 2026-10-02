@@ -98,16 +98,31 @@ class Toolbox:
             return None
 
     def place(self, refresh=False):
-        """Cached location; refreshed at most once a day. Never raises: if a fresh fix
-        isn't available, the last known place is used."""
+        """Last known location, instantly. A stale one (over a day old) is refreshed in the
+        background at most once an hour, because a location fix can take 45 s or time out
+        and this runs while building every request. Never raises."""
         cached = json.loads(PLACE_FILE.read_text()) if PLACE_FILE.exists() else {}
         if cached and not cached.get("tz") and "lat" in cached:
             tz = self._timezone_at(cached["lat"], cached["lon"])
             if tz:
                 cached["tz"] = tz
                 PLACE_FILE.write_text(json.dumps(cached))
-        if cached and not refresh and time.time() - cached.get("at", 0) < 86400:
-            return cached
+        if refresh or not cached:
+            return self._refresh_place(cached)
+        if time.time() - cached.get("at", 0) > 86400 and not getattr(self, "_refreshing", False) \
+                and time.time() - getattr(self, "_place_tried", 0) > 3600:
+            self._refreshing, self._place_tried = True, time.time()
+
+            def bg():
+                try:
+                    self._refresh_place(cached)
+                finally:
+                    self._refreshing = False
+
+            threading.Thread(target=bg, daemon=True, name="place-refresh").start()
+        return cached
+
+    def _refresh_place(self, cached):
         try:
             fix = termux("termux-location", "-p", "network", "-r", "once", timeout=45)
         except Exception:
