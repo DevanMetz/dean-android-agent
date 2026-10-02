@@ -1078,7 +1078,17 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except MicMuted:
-        show("warn", "mic is muted by Android (Termux not on screen) — restarting audio")
+        # Android mutes the mic while Termux isn't on screen (Home pressed, a USB pop-up...).
+        # Give whoever is using the tablet a moment, then come back to the front.
+        wait = float(os.environ.get("DEAN_RETURN_AFTER", "120")) - 30  # 30 s already passed
+        show("warn", "mic is muted by Android (Termux not on screen)"
+             + (f"; coming back to the front in {wait:.0f} s" if wait >= 0 else ""))
+        if wait >= 0:
+            time.sleep(wait)
+            try:
+                Toolbox.show_termux()
+            except Exception as e:
+                show("warn", f"couldn't bring Termux back: {e}")
         sys.exit(3)
     except KeyboardInterrupt:
         sys.exit(0)

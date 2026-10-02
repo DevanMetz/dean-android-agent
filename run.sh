@@ -4,6 +4,9 @@
 TZ_NAME=$(getprop persist.sys.timezone)
 PULSE_SOCKET=$PREFIX/tmp/dean-pulse.socket
 while true; do
+  # Termux is on screen whenever this runs, so Android accepts its foreground service
+  # again; without it Termux (and Dean) gets frozen whenever it leaves the screen.
+  termux-wake-unlock; termux-wake-lock
   pkill -9 pulseaudio 2>/dev/null; sleep 1
   # audio goes over a socket in Termux's private storage, so no other app can tap the mic
   # (the Debian side needs enable-shm/enable-memfd = no in /etc/pulse/client.conf.d/)

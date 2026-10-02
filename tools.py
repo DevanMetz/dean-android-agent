@@ -490,6 +490,11 @@ class Toolbox:
                "left_before_limit": money(d.get("limit_remaining"))}
         return {k: v for k, v in out.items() if v is not None}
 
+    @staticmethod
+    def show_termux():
+        """Bring Dean's screen (Termux) back to the front so Android unmutes the mic."""
+        return _run(["am", "start", "-n", "com.termux/.app.TermuxActivity"], 20, None)
+
     def restart_sensor_app(self):
         """Used by the health check when the Dean Sensors app stops answering."""
         return _run(["am", "broadcast", "-n", "com.dean.sensors/.BootReceiver",
