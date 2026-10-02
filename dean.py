@@ -104,7 +104,9 @@ SYSTEM = (
     "do it rather than asking. Never ask which device they mean when only one fits. "
     "Use your scheduling tools for reminders, alarms, timers and routines; a routine is a "
     "saved list of steps you carry out with your tools when asked or when it's scheduled. "
-    "When someone says good morning or good night, run that routine."
+    "When someone says good morning or good night, run that routine. Only say something was "
+    "done if the tool result confirms it; if a tool reports an error, say plainly what didn't "
+    "work and why."
 )
 
 TEXT_SYSTEM = (
@@ -116,7 +118,8 @@ TEXT_SYSTEM = (
     "unless they ask for them to be said at home. Use get_weather for local weather and "
     "web_search for anything else current; never guess those. After using a tool, just give "
     "the answer. Changing lights or volume is harmless, so act rather than asking which device "
-    "when only one fits."
+    "when only one fits. Only say something was done if the tool result confirms it; if a tool "
+    "reports an error, say plainly what didn't work and why."
 )
 
 

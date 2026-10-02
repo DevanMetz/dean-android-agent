@@ -77,3 +77,20 @@ def test_roku_status_parses_power_and_app():
 
     assert fake_tv(handler).status() == {"name": "Den TV", "power": "on", "app": "Netflix",
                                          "playback": "play"}
+
+
+def test_confirm_detects_dead_and_ignored_lights(monkeypatch):
+    g = lights_file([{"name": "living room bulb", "lan_ip": "10.0.0.3"}])
+    sent = []
+    monkeypatch.setattr(Govee, "lan_send", staticmethod(lambda ip, cmd, data: sent.append(cmd)))
+    monkeypatch.setattr(govee.time, "sleep", lambda s: None)
+
+    monkeypatch.setattr(Govee, "lan_status", staticmethod(lambda ip, timeout=1.5: None))
+    r = g.apply_and_confirm(g.lights[0], on=True)
+    assert "switched off at the wall" in r["error"] and sent == ["turn", "turn"]  # retried once
+
+    monkeypatch.setattr(Govee, "lan_status", staticmethod(
+        lambda ip, timeout=1.5: {"onOff": 1, "brightness": 50}))
+    assert g.apply_and_confirm(g.lights[0], on=True, brightness=50)["confirmed"] is True
+    r = g.apply_and_confirm(g.lights[0], brightness=100)
+    assert r["error"] == "living room bulb didn't change" and r["it_reports"]["brightness"] == 50

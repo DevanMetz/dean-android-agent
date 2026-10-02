@@ -240,6 +240,45 @@ class Govee:
             self.cloud_control(light, "devices.capabilities.color_setting", "colorTemperatureK",
                                int(kelvin))
 
+    @staticmethod
+    def matches(s, on=None, brightness=None, color=None, kelvin=None):
+        """Does a LAN status reply show the requested change?"""
+        if on is not None and (s.get("onOff") == 1) != on:
+            return False
+        if on is False:
+            return True  # off: nothing else to compare
+        if brightness is not None and abs((s.get("brightness") or 0) - brightness) > 2:
+            return False
+        if color is not None:
+            c = s.get("color") or {}
+            if any(abs(c.get(k, 0) - v) > 8 for k, v in zip("rgb", color)):
+                return False
+        if kelvin is not None and abs((s.get("colorTemInKelvin") or 0) - kelvin) > 150:
+            return False
+        return True
+
+    def apply_and_confirm(self, light, on=None, brightness=None, color=None, kelvin=None):
+        """Send the change, then read the light back; re-send once if it didn't take.
+        LAN commands are fire-and-forget UDP, so without this a light that's switched
+        off at the wall would be reported as changed."""
+        name = light["name"]
+        if not light.get("lan_ip"):
+            self.apply(light, on, brightness, color, kelvin)  # the cloud API confirms itself
+            return {"light": name, "done": True}
+        for attempt in range(2):
+            self.apply(light, on, brightness, color, kelvin)
+            time.sleep(0.6)
+            s = self.lan_status(light["lan_ip"])
+            if s is None:
+                continue
+            if self.matches(s, on, brightness, color, kelvin):
+                return {"light": name, "done": True, "confirmed": True}
+        if s is None:
+            return {"light": name, "error": f"{name} isn't responding on the network; it may be "
+                                             "switched off at the wall"}
+        return {"light": name, "error": f"{name} didn't change",
+                "it_reports": {"on": s.get("onOff") == 1, "brightness": s.get("brightness")}}
+
     def status(self, light):
         if light.get("lan_ip"):
             s = self.lan_status(light["lan_ip"])

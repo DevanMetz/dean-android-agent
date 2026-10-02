@@ -424,8 +424,8 @@ class Toolbox:
             try:
                 if not change:
                     return {"light": light["name"], **self.govee.status(light)}
-                self.govee.apply(light, on=on, brightness=brightness, color=rgb, kelvin=kelvin)
-                return {"light": light["name"], "done": True}
+                return self.govee.apply_and_confirm(light, on=on, brightness=brightness,
+                                                    color=rgb, kelvin=kelvin)
             except Exception as e:
                 return {"light": light["name"], "error": f"{type(e).__name__}: {e}"}
 
